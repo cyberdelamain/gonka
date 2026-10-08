@@ -42,3 +42,7 @@ func PruneEpochZeroInferencesForTesting(k Keeper, ctx sdk.Context, currentEpochI
 	p.remove = remove
 	return p.prune(ctx, k, currentEpochIndex, nil)
 }
+
+func PruneDeveloperStatsWithBudgetForTesting(k Keeper, ctx context.Context, budget *int64) error {
+	return developerStatsPruner{}.prune(ctx, k, 0, budget)
+}
