@@ -41,6 +41,11 @@ jobs:
   # It replaces the previous hardcoded matrix with a dynamically generated one based on the actual test classes
   setup-test-matrix:
     runs-on: ubuntu-latest
+    # checks: write stays on run-tests for the test reporter. This job only
+    # checks out the tree and scans Gradle.
+    permissions:
+      contents: read
+      packages: read
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
     steps:
@@ -76,7 +81,10 @@ jobs:
       - name: Set up Gradle (with caching)
         uses: gradle/actions/setup-gradle@v4
         with:
-          cache-read-only: false
+          # Comment runs execute in the default branch cache scope while
+          # building a pull-request head. Read-only keeps that head from
+          # publishing a cache that later trusted jobs restore.
+          cache-read-only: ${{ inputs.is_pr_comment }}
       # This step uses Gradle tasks to scan for test classes that will actually run tests after filtering
       # The tasks properly handle both class-level and method-level tags:
       # 1. Classes with @Tag("exclude") or @Tag("unstable") at the class level are completely excluded
@@ -109,6 +117,11 @@ jobs:
 
   build-images:
     runs-on: ubuntu-latest
+    # No registry login: USE_REGISTRY_CACHE=0 and the image bases are public,
+    # so this job never needs the token that docker login would write to disk.
+    permissions:
+      contents: read
+      packages: read
     steps:
       - name: Check initial disk space
         run: |
@@ -144,13 +157,6 @@ jobs:
           docker --version
           docker compose version
 
-      - name: Login to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Install Make
         run: |
           sudo apt-get update
@@ -165,7 +171,7 @@ jobs:
       - name: Set up Gradle (with caching)
         uses: gradle/actions/setup-gradle@v4
         with:
-          cache-read-only: false
+          cache-read-only: ${{ inputs.is_pr_comment }}
 
       - name: Make Docker Images
         env:
@@ -303,7 +309,7 @@ jobs:
       - name: Set up Gradle (with caching)
         uses: gradle/actions/setup-gradle@v4
         with:
-          cache-read-only: false
+          cache-read-only: ${{ inputs.is_pr_comment }}
 
       - name: Download Upgrade Build Files
         if: ${{ inputs.enable_upgrades }}
@@ -492,7 +498,7 @@ jobs:
       contents: read
     steps:
       - name: Checkout workflow ref
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
@@ -538,6 +544,10 @@ jobs:
             counts="$RUNNER_TEMP/bq-counts/test-counts-${group}/test-counts-${group}.txt"
             if [ -f "$counts" ]; then
               report_url="$(sed -n 's/^TEST_REPORT_URL: *//p' "$counts" | head -n1)"
+              # The reporter writes N/A when it has no URL. BigQuery used to store that as empty.
+              if [ "$report_url" = "N/A" ]; then
+                report_url=""
+              fi
               logs_url="$(sed -n 's/^LOGS_URL: *//p' "$counts" | head -n1)"
             fi
             echo "Uploading group: ${group}"
