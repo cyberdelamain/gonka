@@ -14,7 +14,7 @@ import (
 // Mainnet epoch 418: TotalWeight 841326, 7 members removed by
 // deactiveParticipant (failed_confirmation_poc), 16 left with 419861 < 420664.
 // Here: TotalWeight 100, removed member held 60, the two left hold 20+20.
-func TestBridgeExchange_MajorityUnreachableAfterMemberRemoval(t *testing.T) {
+func TestBridgeExchange_CompletesAfterMajorityMemberRemoval(t *testing.T) {
 	k, ms, ctx, mocks := setupKeeperWithMocks(t)
 
 	a := testutil.Validator
@@ -54,25 +54,36 @@ func TestBridgeExchange_MajorityUnreachableAfterMemberRemoval(t *testing.T) {
 		}}, nil,
 	).AnyTimes()
 
-	vote := func(v string) error {
-		_, err := ms.BridgeExchange(ctx, &types.MsgBridgeExchange{
-			OriginChain: "ethereum", ContractAddress: "0x123", OwnerAddress: "0xabc",
+	// A WGNK burn, as on mainnet: completion releases native coins from escrow.
+	recipient := sdk.AccAddress([]byte("bridge_recipient____")).String()
+	k.SetBridgeContractAddress(ctx, types.BridgeContractAddress{Id: "1", ChainId: "ethereum", Address: "0x123"})
+	newMsg := func(v string) *types.MsgBridgeExchange {
+		return &types.MsgBridgeExchange{
+			OriginChain: "ethereum", ContractAddress: "0x123", OwnerAddress: recipient,
 			Amount: "100", BlockNumber: "1000", ReceiptIndex: "1", Validator: v,
-		})
+		}
+	}
+	vote := func(v string) error {
+		_, err := ms.BridgeExchange(ctx, newMsg(v))
 		return err
 	}
 	require.NoError(t, vote(a))
 	require.ErrorIs(t, vote(removed), types.ErrBridgeValidatorNotInTxEpochGroup)
 
-	// The last member still in the group votes: does that vote reach the majority?
-	msgB := &types.MsgBridgeExchange{
-		OriginChain: "ethereum", ContractAddress: "0x123", OwnerAddress: "0xabc",
-		Amount: "100", BlockNumber: "1000", ReceiptIndex: "1", Validator: b,
-	}
-	validated, err := k.ValidateBridgeExchange(ctx, msgB)
+	// The last member still in the group votes; on the base its 40 of 100 never reach 51.
+	validated, err := k.ValidateBridgeExchange(ctx, newMsg(b))
 	require.NoError(t, err)
-	require.False(t, validated.IsCreate)
 	require.Equal(t, int64(40), validated.VotedPower, "every member still in the group has voted")
-	require.GreaterOrEqual(t, validated.VotedPower, validated.RequiredPower,
-		"all remaining weight voted, yet the record needs a majority of the epoch-start weight")
+	require.Equal(t, int64(34), validated.RequiredPower, "floor TotalWeight/3+1")
+
+	escrow := sdk.AccAddress([]byte("bridge_escrow_______"))
+	mocks.AccountKeeper.EXPECT().GetModuleAddress(types.BridgeEscrowAccName).Return(escrow).AnyTimes()
+	mocks.BankViewKeeper.EXPECT().SpendableCoin(gomock.Any(), escrow, types.BaseCoin).Return(sdk.NewInt64Coin(types.BaseCoin, 1000)).AnyTimes()
+	mocks.BankKeeper.EXPECT().SendCoinsFromModuleToAccount(gomock.Any(), types.BridgeEscrowAccName,
+		sdk.MustAccAddressFromBech32(recipient), sdk.NewCoins(sdk.NewInt64Coin(types.BaseCoin, 100)), "bridge_release").Return(nil).Times(1)
+	require.NoError(t, vote(b))
+
+	tx, found := k.GetBridgeTransactionByContent(ctx, validated.ExistingTx)
+	require.True(t, found)
+	require.Equal(t, types.BridgeTransactionStatus_BRIDGE_COMPLETED, tx.Status)
 }
