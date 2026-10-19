@@ -6,6 +6,7 @@ package nmrpc
 import (
 	"context"
 	"errors"
+	"time"
 
 	"common/chainoracle/blocks"
 	"common/nodemanager/gen"
@@ -30,9 +31,13 @@ func GetBlockHeader(ctx context.Context, oracle blocks.BlockOracle, req *gen.Get
 		h   *blocks.Header
 		err error
 	)
-	if height == 0 {
+	waiter, canWait := oracle.(blocks.HeaderWaiter)
+	switch {
+	case height == 0:
 		h, err = oracle.Latest(ctx)
-	} else {
+	case req.GetWaitMs() > 0 && canWait:
+		h, err = waiter.AtWait(ctx, height, time.Duration(req.GetWaitMs())*time.Millisecond)
+	default:
 		h, err = oracle.At(ctx, height)
 	}
 	if err != nil {

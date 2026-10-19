@@ -13,6 +13,7 @@ import (
 	"common/chain"
 	"common/chainoracle/blocks"
 	"common/chainoracle/blocks/nmclient"
+	"common/chainoracle/blocks/observer"
 	"common/nodemanager"
 	"devshard/chainoracle/blocks/direct"
 	"devshard/chainoracle/blocks/failover"
@@ -85,6 +86,19 @@ func initGatewayHeightSync(chainClient *chain.Client, cometRPC string) error {
 	return err
 }
 
+func gatewayHeaderTimeSource(cometRPC string, fallback blocks.BlockOracle) *headertime.Source {
+	if cometRPC != "" {
+		verified, err := observer.NewTendermint(observer.TendermintConfig{RPCURL: cometRPC, VerifyCommits: true})
+		if err == nil {
+			slog.Info("header times verified by commit signatures", "comet_rpc", cometRPC)
+			return headertime.New(verified)
+		}
+		slog.Warn("header times: verifying oracle unavailable", "err", err, "comet_rpc", cometRPC)
+	}
+	slog.Warn("header times are not signature-verified: no Comet RPC for the gateway")
+	return headertime.New(fallback)
+}
+
 func gatewayHeaderTimes() state.HeaderTimeSource {
 	st, err := loadHeightSyncProcessState(nil, effectiveChainRPC())
 	if err != nil || st == nil || st.headerTimes == nil {
@@ -145,7 +159,7 @@ func loadHeightSyncProcessState(chainClient *chain.Client, cometRPC string) (*he
 				nmClose()
 			}
 		}
-		hsSt = &heightSyncProcessState{oracle: fo, headerTimes: headertime.New(fo), closer: closer}
+		hsSt = &heightSyncProcessState{oracle: fo, headerTimes: gatewayHeaderTimeSource(rpc, fo), closer: closer}
 		slog.Info("height sync chain follower enabled",
 			"node_manager", nmOracle != nil, "direct_chain", chainOracle != nil, "comet_rpc", rpc)
 	})

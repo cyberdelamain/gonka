@@ -840,6 +840,22 @@ Header availability is part of the rule:
 - Settlement computes every live record's timeout before draining. A
   pending header defers the drain rather than refunding.
 
+Where the time comes from:
+
+- dapi serves `(height, hash, time)` only for headers it has proven. A new
+  height is light-verified against commit signatures from the last trusted
+  header (CometBFT `light.Verify`, trust level 1/3, trusting period 7 days by
+  default). An older height is proven by its hash link to a proven header
+  above it. The history (about a week) and the trust point are kept in dapi's
+  SQLite and reloaded on restart. `DAPI_CHAINORACLE_VERIFY_COMMITS=false`
+  turns verification off.
+- `GetBlockHeader` takes `wait_ms`, so a host asking for a height the chain
+  has not produced yet is answered when the block is proven instead of
+  polling. The public HTTP `/block/:height` route does not wait.
+- devshardd reads header times only from dapi; it falls back to direct chain
+  gRPC only when dapi is unreachable, never when dapi answers "not found".
+  The gateway, which runs no dapi, light-verifies against its own Comet RPC.
+
 This is the §1 motivation applied inward: a deadline that depends on each
 host's clock cannot be agreed on, a block's header time can. Any decision
 that folds into a state root changes under a version gate rather than a

@@ -420,6 +420,51 @@ func (o *Oracle) HeaderAt(ctx context.Context, height int64) (*blocks.Header, er
 	return cloneHeader(h), nil
 }
 
+// HeaderAtWait reads one height for a header-time decision. It asks the
+// NodeManager first and waits up to wait for a height that is not out yet.
+// The local NewBlock window is skipped: it is the unverified Comet feed, and
+// dapi may be serving only light-verified headers. Direct chain gRPC is used
+// only when the NodeManager is absent or failing, never to second-guess a
+// NodeManager that answered "not found".
+func (o *Oracle) HeaderAtWait(ctx context.Context, height int64, wait time.Duration) (*blocks.Header, error) {
+	if o == nil || height <= 0 {
+		return blocks.DummyHeader(height), nil
+	}
+	now := o.now()
+	if blocked, _ := o.nmBlocked(now); !blocked {
+		var h *blocks.Header
+		var err error
+		if w, ok := o.nm.(blocks.HeaderWaiter); ok && wait > 0 {
+			h, err = w.AtWait(ctx, height, wait)
+		} else {
+			h, err = o.nm.At(ctx, height)
+		}
+		logAtTry("get_block_header_wait", height, h, err)
+		if err == nil && usable(h) && h.Height == height {
+			o.noteNMOutcome(now, h, nil)
+			return cloneHeader(h), nil
+		}
+		if err == nil || errors.Is(err, blocks.ErrHeaderNotFound) {
+			return blocks.DummyHeader(height), nil
+		}
+		if permanentNMSkip(err) || transientNM(err) {
+			o.noteNMOutcome(now, nil, err)
+		}
+	}
+	if o.chain == nil {
+		return blocks.DummyHeader(height), nil
+	}
+	h, err := o.chain.At(ctx, height)
+	logAtTry("get_block_by_height", height, h, err)
+	if err != nil {
+		return nil, err
+	}
+	if !usable(h) || h.Height != height {
+		return blocks.DummyHeader(height), nil
+	}
+	return cloneHeader(h), nil
+}
+
 func (o *Oracle) atFetch(ctx context.Context, height int64, now time.Time) (*blocks.Header, error) {
 	if blocked, skipErr := o.nmBlocked(now); blocked {
 		logAtTry("get_block_header", height, nil, skipErr)

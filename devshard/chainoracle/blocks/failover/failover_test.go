@@ -599,3 +599,49 @@ func TestOracle_AtSingleflightSharesRPC(t *testing.T) {
 		require.Equal(t, []byte{1, 2, 3, 4}, got[i].BlockHash)
 	}
 }
+
+type waitingNM struct {
+	recOracle
+	waited atomic.Int64
+}
+
+func (w *waitingNM) AtWait(ctx context.Context, height int64, wait time.Duration) (*blocks.Header, error) {
+	w.waited.Store(int64(wait))
+	return w.At(ctx, height)
+}
+
+func TestHeaderAtWaitAsksTheNodeManagerWithTheWait(t *testing.T) {
+	nm := &waitingNM{recOracle: recOracle{hdr: nmHdr()}}
+	chain := &recOracle{hdr: nmHdr()}
+	tip := &recOracle{hdr: blocks.HashOnlyHeader(7, time.Unix(1, 0), "gonka-test", []byte{0xee})}
+	o := failover.New(tip, nm, chain)
+	o.SetCometConnected(true)
+
+	h, err := o.HeaderAtWait(context.Background(), 7, 3*time.Second)
+	require.NoError(t, err)
+	require.Equal(t, []byte{1, 2, 3, 4}, h.BlockHash, "the local NewBlock window is not consulted")
+	require.Equal(t, int64(3*time.Second), nm.waited.Load())
+	require.Zero(t, chain.calls.Load())
+}
+
+func TestHeaderAtWaitTrustsANodeManagerNotFound(t *testing.T) {
+	nm := &recOracle{}
+	chain := &recOracle{hdr: nmHdr()}
+	o := failover.New(nil, nm, chain)
+
+	h, err := o.HeaderAtWait(context.Background(), 7, time.Second)
+	require.NoError(t, err)
+	require.True(t, blocks.IsDummyHeader(h))
+	require.Zero(t, chain.calls.Load(), "a height dapi has not proven is not taken from the chain feed")
+}
+
+func TestHeaderAtWaitFallsBackToTheChainWhenTheNodeManagerIsDown(t *testing.T) {
+	nm := &recOracle{err: status.Error(codes.Unavailable, "down")}
+	chain := &recOracle{hdr: nmHdr()}
+	o := failover.New(nil, nm, chain)
+
+	h, err := o.HeaderAtWait(context.Background(), 7, time.Second)
+	require.NoError(t, err)
+	require.Equal(t, int64(7), h.Height)
+	require.Equal(t, int64(1), chain.calls.Load())
+}

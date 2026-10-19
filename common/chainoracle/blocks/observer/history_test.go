@@ -83,11 +83,12 @@ func TestAtRefusesABatchWhoseHeaderDoesNotHashToItsBlockID(t *testing.T) {
 	o := newOracle(rpc)
 
 	h, err := o.At(context.Background(), 500)
-	require.NoError(t, err, "the single-header fallback still answers")
+	require.NoError(t, err)
 	require.Equal(t, int64(500), h.Height)
-	require.Equal(t, int64(1), rpc.headerCall.Load())
 	_, ok := o.history.Get(505)
 	require.False(t, ok, "a header whose time was changed is never stored")
+	_, ok = o.history.Get(506)
+	require.True(t, ok, "the rest of the batch is kept")
 }
 
 func TestAtAboveTheTipIsNotFound(t *testing.T) {

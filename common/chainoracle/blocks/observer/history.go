@@ -3,13 +3,13 @@ package observer
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"sync"
 	"time"
 
 	"common/chainoracle/blocks"
 
 	ctypes "github.com/cometbft/cometbft/rpc/core/types"
+	cmttypes "github.com/cometbft/cometbft/types"
 )
 
 const (
@@ -22,8 +22,17 @@ type blockchainInfoRPC interface {
 }
 
 type historyEntry struct {
-	hash   []byte
-	timeMs int64
+	hash     []byte
+	prevHash []byte
+	timeMs   int64
+}
+
+type StoredHeader struct {
+	Height   int64
+	Hash     []byte
+	PrevHash []byte
+	TimeMs   int64
+	ChainID  string
 }
 
 type History struct {
@@ -33,29 +42,48 @@ type History struct {
 	chainID string
 	top     int64
 	entries map[int64]historyEntry
+	changed chan struct{}
 }
 
 func NewHistory(window int64) *History {
 	if window <= 0 {
 		window = DefaultHistoryHeights
 	}
-	return &History{window: window, entries: make(map[int64]historyEntry)}
+	return &History{window: window, entries: make(map[int64]historyEntry), changed: make(chan struct{})}
 }
 
-func (h *History) Put(hdr *blocks.Header) {
-	if h == nil || hdr == nil || hdr.Height <= 0 || hdr.Time.IsZero() || len(hdr.BlockHash) == 0 {
-		return
+func (h *History) Put(hdr *blocks.Header) bool {
+	if hdr == nil || hdr.Time.IsZero() {
+		return false
+	}
+	return h.PutStored(StoredHeader{Height: hdr.Height, Hash: hdr.BlockHash, TimeMs: hdr.Time.UnixMilli(), ChainID: hdr.ChainID})
+}
+
+func (h *History) PutStored(s StoredHeader) bool {
+	if h == nil || s.Height <= 0 || s.TimeMs == 0 || len(s.Hash) == 0 {
+		return false
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if hdr.ChainID != "" {
-		h.chainID = hdr.ChainID
+	if s.ChainID != "" {
+		h.chainID = s.ChainID
 	}
-	h.entries[hdr.Height] = historyEntry{hash: append([]byte(nil), hdr.BlockHash...), timeMs: hdr.Time.UnixMilli()}
-	if hdr.Height > h.top {
-		h.top = hdr.Height
+	if h.top > 0 && s.Height <= h.top-h.window {
+		return false
+	}
+	prev, had := h.entries[s.Height]
+	e := historyEntry{hash: append([]byte(nil), s.Hash...), prevHash: append([]byte(nil), s.PrevHash...), timeMs: s.TimeMs}
+	if had && len(e.prevHash) == 0 {
+		e.prevHash = prev.prevHash
+	}
+	h.entries[s.Height] = e
+	if s.Height > h.top {
+		h.top = s.Height
 		h.evictLocked()
 	}
+	close(h.changed)
+	h.changed = make(chan struct{})
+	return true
 }
 
 func (h *History) evictLocked() {
@@ -68,6 +96,13 @@ func (h *History) evictLocked() {
 			delete(h.entries, height)
 		}
 	}
+}
+
+func (h *History) entry(height int64) (historyEntry, bool) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	e, ok := h.entries[height]
+	return e, ok
 }
 
 func (h *History) Get(height int64) (*blocks.Header, bool) {
@@ -83,6 +118,38 @@ func (h *History) Get(height int64) (*blocks.Header, bool) {
 	return blocks.HashOnlyHeader(height, time.UnixMilli(e.timeMs).UTC(), h.chainID, e.hash), true
 }
 
+func (h *History) Changed() <-chan struct{} {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.changed
+}
+
+func (h *History) Top() int64 {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.top
+}
+
+func (h *History) ChainID() string {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.chainID
+}
+
+func (h *History) lowestLinkedAbove(height int64) (int64, historyEntry, bool) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	for next := height + 1; next <= h.top; next++ {
+		if e, ok := h.entries[next]; ok {
+			if len(e.prevHash) == 0 {
+				return 0, historyEntry{}, false
+			}
+			return next, e, true
+		}
+	}
+	return 0, historyEntry{}, false
+}
+
 func (h *History) Len() int {
 	if h == nil {
 		return 0
@@ -92,20 +159,31 @@ func (h *History) Len() int {
 	return len(h.entries)
 }
 
-func headersFromBlockchainInfo(res *ctypes.ResultBlockchainInfo) ([]*blocks.Header, error) {
-	if res == nil {
-		return nil, nil
+func storedFromHeader(hdr *cmttypes.Header) StoredHeader {
+	return StoredHeader{
+		Height:   hdr.Height,
+		Hash:     hdr.Hash().Bytes(),
+		PrevHash: hdr.LastBlockID.Hash.Bytes(),
+		TimeMs:   hdr.Time.UnixMilli(),
+		ChainID:  hdr.ChainID,
 	}
-	out := make([]*blocks.Header, 0, len(res.BlockMetas))
+}
+
+func headersFromBlockchainInfo(res *ctypes.ResultBlockchainInfo) []*cmttypes.Header {
+	if res == nil {
+		return nil
+	}
+	out := make([]*cmttypes.Header, 0, len(res.BlockMetas))
 	for _, meta := range res.BlockMetas {
 		if meta == nil {
 			continue
 		}
-		hash := meta.Header.Hash().Bytes()
+		hdr := meta.Header
+		hash := hdr.Hash().Bytes()
 		if len(hash) == 0 || len(meta.BlockID.Hash) > 0 && !bytes.Equal(hash, meta.BlockID.Hash.Bytes()) {
-			return nil, fmt.Errorf("observer: block %d header hash does not match block id", meta.Header.Height)
+			continue
 		}
-		out = append(out, blocks.HashOnlyHeader(meta.Header.Height, meta.Header.Time, meta.Header.ChainID, hash))
+		out = append(out, &hdr)
 	}
-	return out, nil
+	return out
 }

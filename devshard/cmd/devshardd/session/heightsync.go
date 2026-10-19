@@ -113,7 +113,6 @@ func (m *HostManager) ObserveChainHeader(h *blocks.Header) {
 	if m == nil {
 		return
 	}
-	m.headerTimes.Observe(h)
 	tip := m.heightSyncTip
 	if tip == nil {
 		logging.Debug("heightsync: comet observe skipped", inferenceTypes.System, "reason", "no cache")

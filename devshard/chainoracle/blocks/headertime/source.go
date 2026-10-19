@@ -21,6 +21,10 @@ type HistoryOracle interface {
 	HeaderAt(ctx context.Context, height int64) (*blocks.Header, error)
 }
 
+type WaitingOracle interface {
+	HeaderAtWait(ctx context.Context, height int64, wait time.Duration) (*blocks.Header, error)
+}
+
 type entry struct {
 	hash []byte
 	ms   int64
@@ -142,6 +146,13 @@ func (s *Source) fetch(height int64) (*blocks.Header, error) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), s.fetchTimeout)
 	defer cancel()
+	wait := s.fetchTimeout - time.Second
+	if w, ok := s.oracle.(WaitingOracle); ok && wait > 0 {
+		return w.HeaderAtWait(ctx, height, wait)
+	}
+	if w, ok := s.oracle.(blocks.HeaderWaiter); ok && wait > 0 {
+		return w.AtWait(ctx, height, wait)
+	}
 	if hist, ok := s.oracle.(HistoryOracle); ok {
 		return hist.HeaderAt(ctx, height)
 	}

@@ -269,7 +269,7 @@ func main() {
 	}
 	hostEventRing := apiconfig.NewHostEventRing(0, uint64(time.Now().UnixNano()))
 	escrowLoadTracker := broker.NewEscrowLoadTracker(0)
-	chainOracle, err := pserver.NewChainOracle(configManager.GetChainNodeConfig().Url)
+	chainOracle, err := pserver.NewChainOracle(configManager.GetChainNodeConfig().Url, configManager.SqlDb().GetDb())
 	if err != nil {
 		logging.Error("Failed to create chainoracle", types.Server, "error", err)
 	}

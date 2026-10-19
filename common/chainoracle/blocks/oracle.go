@@ -36,6 +36,12 @@ type BlockOracle interface {
 	Subscribe(ctx context.Context, fromHeight int64) (<-chan *Header, error)
 }
 
+// HeaderWaiter is a BlockOracle that can wait for a height the chain has
+// not produced yet instead of answering ErrHeaderNotFound at once.
+type HeaderWaiter interface {
+	AtWait(ctx context.Context, height int64, wait time.Duration) (*Header, error)
+}
+
 // HashOnlyHeader is the hash-only wire payload: height, block hash,
 // block timestamp, and chain id. Commit and validator hashes stay empty
 // until Strong (spec §8 / §15).
