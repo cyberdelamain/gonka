@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
-	"time"
 
 	"google.golang.org/protobuf/proto"
 
@@ -52,29 +51,8 @@ func (h *Host) CheckEvidence(rec *types.InferenceRecord, txs ...*types.DevshardT
 	return h.sm.CheckEvidence(rec, txs...)
 }
 
-const localTipTimeout = 2 * time.Second
-
 func (h *Host) TimeoutDue(inferenceID uint64, reason types.TimeoutReason) error {
-	if err := h.sm.TimeoutDue(inferenceID, reason); err != nil {
-		return err
-	}
-	if h.oracle == nil {
-		return nil
-	}
-	due, err := h.sm.TimeoutDueHeight(inferenceID, reason)
-	if err != nil {
-		return err
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), localTipTimeout)
-	defer cancel()
-	tip, err := h.LatestHeight(ctx)
-	if err != nil || tip <= 0 {
-		return nil
-	}
-	if uint64(tip) < due {
-		return fmt.Errorf("%w: local tip %d is below due height %d", types.ErrTimeoutNotDue, tip, due)
-	}
-	return nil
+	return h.sm.TimeoutDue(inferenceID, reason)
 }
 
 func timeoutDue(ev EvidenceVerifier, inferenceID uint64, reason types.TimeoutReason) bool {
@@ -150,6 +128,11 @@ type ExecutorClient interface {
 	// already-bound session. It cannot CreateSession.
 	GetMempool(ctx context.Context) ([]*types.DevshardTx, error)
 
+	// ChallengeCatchUp sends one encoded page with a nil payload. The receipt
+	// and mempool in the response are ignored. protocolVersion is empty:
+	// a cold executor reads the version from the diffs.
+	ChallengeCatchUp(ctx context.Context, inferenceID uint64, diffs []types.DiffWire, protocolVersion string) error
+
 	// ChallengeReceipt forwards creator-signed diffs to the executor.
 	// The host CreateSession from the gateway signature in those diffs when
 	// it has not bound the escrow, then applies missing diffs. With a payload
@@ -177,8 +160,16 @@ type SessionTip interface {
 type RefusalJournal interface {
 	// Anchor reports whether nonce is stored and its state hash equals root.
 	Anchor(nonce uint64, root []byte) (bool, error)
-	// Diffs returns the contiguous diffs in [from, to]. from > to is empty.
-	Diffs(from, to uint64) ([]types.Diff, error)
+	// Pages calls fn with each challenge page of [from, to], in order.
+	// The page transactions stay encoded. more is false only for the last
+	// page. fn may copy that page. It must not retain a page after it
+	// returns. When the page has to be sent before the next one is loaded,
+	// fn returns a send func that does not reference the page. Pages drops
+	// the page and then calls send. next, when non-nil, is read after send.
+	// The following read starts at max(last+1, next()), so nonces the cursor
+	// has passed are not loaded. A hole returns an error and does not call
+	// fn with a partial page. from > to does not call fn.
+	Pages(ctx context.Context, from, to uint64, next func() uint64, fn func(page []types.DiffWire, more bool) (send func(context.Context) error, err error)) error
 }
 
 // TxSink receives mempool txs copied from a challenge-receipt response.
@@ -206,8 +197,7 @@ func RecoveryTxsFor(txs []*types.DevshardTx, inferenceID uint64) []*types.Devsha
 	return out
 }
 
-func VerifiedRecoveryTxsFor(ev EvidenceVerifier, st types.EscrowState, inferenceID uint64, pool []*types.DevshardTx) []*types.DevshardTx {
-	rec := st.Inferences[inferenceID]
+func VerifiedRecoveryTxsFor(ev EvidenceVerifier, st types.EscrowState, inferenceID uint64, rec *types.InferenceRecord, pool []*types.DevshardTx) []*types.DevshardTx {
 	if rec == nil {
 		return nil
 	}
@@ -242,13 +232,14 @@ func VerifyRefusedTimeout(
 	ctx context.Context,
 	st types.EscrowState,
 	inferenceID uint64,
+	rec *types.InferenceRecord,
 	payload *InferencePayload,
 	localMempool []*types.DevshardTx,
 	executorClient ExecutorClient,
 	ingest TxSink,
 	ev EvidenceVerifier,
 ) (bool, error) {
-	return verifyRefusedTimeout(ctx, st, inferenceID, payload, localMempool, nil, executorClient, ingest, ev)
+	return verifyRefusedTimeout(ctx, st, inferenceID, rec, payload, localMempool, nil, executorClient, ingest, ev)
 }
 
 type refusedChallenge int
@@ -263,6 +254,7 @@ func verifyRefusedTimeout(
 	ctx context.Context,
 	st types.EscrowState,
 	inferenceID uint64,
+	rec *types.InferenceRecord,
 	payload *InferencePayload,
 	localMempool []*types.DevshardTx,
 	diffs []types.Diff,
@@ -270,8 +262,7 @@ func verifyRefusedTimeout(
 	ingest TxSink,
 	ev EvidenceVerifier,
 ) (bool, error) {
-	rec, ok := st.Inferences[inferenceID]
-	if !ok {
+	if rec == nil {
 		return false, fmt.Errorf("inference %d not found", inferenceID)
 	}
 	if rec.Status != types.StatusPending {
@@ -324,7 +315,20 @@ func challengeRefused(
 	ingest TxSink,
 	ev EvidenceVerifier,
 ) (refusedChallenge, error) {
-	receipt, mempool, err := executorClient.ChallengeReceipt(ctx, inferenceID, payload, diffs)
+	return judgeRefusedChallenge(escrowID, inferenceID, rec, ingest, ev, func() ([]byte, []*types.DevshardTx, error) {
+		return executorClient.ChallengeReceipt(ctx, inferenceID, payload, diffs)
+	})
+}
+
+func judgeRefusedChallenge(
+	escrowID string,
+	inferenceID uint64,
+	rec *types.InferenceRecord,
+	ingest TxSink,
+	ev EvidenceVerifier,
+	call func() ([]byte, []*types.DevshardTx, error),
+) (refusedChallenge, error) {
+	receipt, mempool, err := call()
 	if err != nil {
 		// The caller decides whether this error is an answer or no HTTP response.
 		return refusedUnreachable, err
@@ -366,13 +370,13 @@ func VerifyExecutionTimeout(
 	ctx context.Context,
 	st types.EscrowState,
 	inferenceID uint64,
+	rec *types.InferenceRecord,
 	localMempool []*types.DevshardTx,
 	executorClient ExecutorClient,
 	ingest TxSink,
 	ev EvidenceVerifier,
 ) (bool, error) {
-	rec, ok := st.Inferences[inferenceID]
-	if !ok {
+	if rec == nil {
 		return false, fmt.Errorf("inference %d not found", inferenceID)
 	}
 	if rec.Status != types.StatusStarted {

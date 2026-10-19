@@ -126,9 +126,9 @@ func (sm *StateMachine) logStateRootMismatchDiagnosticLocked(opts StateRootMisma
 	}
 	if opts.SealClock.Known {
 		diagArgs = append(diagArgs,
-			"auto_seal_state_clock", opts.SealClock.Clock,
-			"auto_seal_window_min_confirmed_height", opts.SealClock.MinConfirmedHeight,
-			"auto_seal_window_max_confirmed_height", opts.SealClock.MaxConfirmedHeight,
+			"auto_seal_state_clock_ms", opts.SealClock.ClockMs,
+			"auto_seal_window_min_confirmed_at_ms", opts.SealClock.MinConfirmedAtMs,
+			"auto_seal_window_max_confirmed_at_ms", opts.SealClock.MaxConfirmedAtMs,
 		)
 	}
 	if len(opts.DiffPostState) > 0 {

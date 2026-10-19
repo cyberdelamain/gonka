@@ -245,9 +245,9 @@ func TestAutoSealStateClock_SkipsUnconfirmedInTailWindow(t *testing.T) {
 
 	clock := d.sm.AutoSealStateClock()
 	require.True(t, clock.Known)
-	require.Equal(t, uint64(5000), clock.MinConfirmedHeight, "an unconfirmed record must not pull window min to zero")
-	require.Equal(t, uint64(5000), clock.MaxConfirmedHeight)
-	require.Equal(t, uint64(5000), clock.Clock)
+	require.Equal(t, int64(5000*testutil.HeightClockBlockMs), clock.MinConfirmedAtMs, "an unconfirmed record must not pull window min to zero")
+	require.Equal(t, int64(5000*testutil.HeightClockBlockMs), clock.MaxConfirmedAtMs)
+	require.Equal(t, int64(5000*testutil.HeightClockBlockMs), clock.ClockMs)
 }
 
 func TestExportAllInferenceRecords_IncludesSealedFromDB(t *testing.T) {
@@ -344,11 +344,11 @@ func TestAutoSeal_FinishedClockGateIncludesExecutionTimeout(t *testing.T) {
 		apply(startNonce+1, txConfirm(&types.MsgConfirmStart{InferenceId: id}))
 	}
 
-	startConfirmAt(4, 4, confirmedHeight+sm.timeoutBlocks(graceSeconds)+1)
+	startConfirmAt(4, 4, confirmedHeight+uint64(graceSeconds)+1)
 	_, live := sm.SnapshotState().Inferences[1]
 	require.True(t, live, "must not seal when only InferenceSealGraceSeconds has elapsed")
 
-	required := sm.timeoutBlocks(FinishedClockRequiredSeconds(graceSeconds, executionTimeout))
+	required := uint64(FinishedClockRequiredSeconds(graceSeconds, executionTimeout))
 	startConfirmAt(6, 6, confirmedHeight+required+1)
 	_, live = sm.SnapshotState().Inferences[1]
 	require.False(t, live, "must seal after grace + execution timeout")

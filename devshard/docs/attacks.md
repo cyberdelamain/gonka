@@ -26,11 +26,13 @@ After `grace` nonces without inclusion, the executor withholds its state signatu
 
 ## Timeout clock manipulation
 
-Timeouts carry no wall-clock time. MsgStartInference must carry exactly the height-sync floor F at its nonce, and the record keeps that floor (height and block hash) as its start anchor. The executor signs its receipt over the same floor, and the confirm anchor is F at the nonce where the receipt lands. A timeout applies only when F at the timeout's nonce has reached anchor + ceil(timeout seconds / block time).
+Timeouts carry no wall-clock time. MsgStartInference must carry exactly the height-sync floor F at its nonce, and the record keeps that floor (height and block hash) as its start anchor. The executor signs its receipt over the same floor, and the confirm anchor is F at the nonce where the receipt lands. Each anchor also stores the block time of its floor block. A timeout applies only when the block time of F at the timeout's nonce, minus the anchor's block time, is at least the timeout. The auto-seal clock is the latest confirm block time, and its grace is measured the same way.
+
+A block time is taken only from the verifier's own chain view, and only when that block's hash equals the floor hash. A height the chain has not produced, or a hash that is not the canonical block at that height, gives no time: the diff waits (header pending) or is rejected (header mismatch). No block interval is ever substituted. A host that is a block behind waits for its node and retries.
 
 The user cannot back-date an anchor: a start or receipt stamped anywhere but the floor is rejected. A record with no anchor (the escrow's first inferences, before any host stamp) can never time out; settlement refunds it instead of paying it.
 
-F only moves on host-signed claims (finishes and height acks), so the user cannot advance the timeout clock alone. A host that signs a fabricated future height can still advance it; that is the height-sync dispute layer's problem, not the timeout's.
+F only moves on host-signed claims (finishes and height acks), so the user cannot advance the timeout clock alone. A host that signs a fabricated future height cannot advance it either: the fabricated block has no header on any honest node, so no verifier can read a time for it, and the gateway does not sequence a floor raise its own chain cannot prove.
 
 ## Redundant validations halt devshard
 

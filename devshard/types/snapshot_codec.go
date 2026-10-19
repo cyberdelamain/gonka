@@ -57,7 +57,6 @@ func EscrowStateToProto(state *EscrowState) *EscrowStateProto {
 			InferenceSealGraceNonces:  cfg.InferenceSealGraceNonces,
 			InferenceSealGraceSeconds: cfg.InferenceSealGraceSeconds,
 			AutoSealEveryNNonces:      cfg.AutoSealEveryNNonces,
-			TimeoutBlockTimeMs:        cfg.TimeoutBlockTimeMs,
 		},
 		Group:                         group,
 		Balance:                       state.Balance,
@@ -134,7 +133,6 @@ func EscrowStateFromProto(msg *EscrowStateProto) *EscrowState {
 			InferenceSealGraceNonces:  p.InferenceSealGraceNonces,
 			InferenceSealGraceSeconds: p.InferenceSealGraceSeconds,
 			AutoSealEveryNNonces:      p.AutoSealEveryNNonces,
-			TimeoutBlockTimeMs:        p.TimeoutBlockTimeMs,
 		}
 	}
 
@@ -209,6 +207,8 @@ func inferenceRecordToProto(id uint64, rec *InferenceRecord) *InferenceRecordPro
 		StartedAtHeight:    rec.StartedAtHeight,
 		StartedAtBlockHash: append([]byte(nil), rec.StartedAtBlockHash...),
 		ConfirmedAtHeight:  rec.ConfirmedAtHeight,
+		StartedAtTimeMs:    rec.StartedAtTimeMs,
+		ConfirmedAtTimeMs:  rec.ConfirmedAtTimeMs,
 		VotesValid:         rec.VotesValid,
 		VotesInvalid:       rec.VotesInvalid,
 		ValidatedBy:        rec.ValidatedBy.Bytes(),
@@ -235,6 +235,8 @@ func inferenceRecordFromProto(msg *InferenceRecordProto) *InferenceRecord {
 		StartedAtHeight:    msg.StartedAtHeight,
 		StartedAtBlockHash: append([]byte(nil), msg.StartedAtBlockHash...),
 		ConfirmedAtHeight:  msg.ConfirmedAtHeight,
+		StartedAtTimeMs:    msg.StartedAtTimeMs,
+		ConfirmedAtTimeMs:  msg.ConfirmedAtTimeMs,
 		VotesValid:         msg.VotesValid,
 		VotesInvalid:       msg.VotesInvalid,
 		ValidatedBy:        Bitmap128FromBytes(msg.ValidatedBy),

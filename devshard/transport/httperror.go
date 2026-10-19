@@ -36,6 +36,9 @@ const (
 	// DevshardErrorStorageBusy is a diff write that could not reach storage
 	// before the request deadline. Nothing was applied; resending is safe.
 	DevshardErrorStorageBusy = "storage_busy"
+	// DevshardErrorHeaderPending is a diff whose height-sync floor block the
+	// host's chain does not have yet. Resending after a block is safe.
+	DevshardErrorHeaderPending = "header_pending"
 	// DevshardErrorHTTPSessionRetired is Phase 7: the Echo session route is
 	// gone. Callers use Connect /sessions/{id}/rpc/ instead.
 	DevshardErrorHTTPSessionRetired = "http_session_retired"

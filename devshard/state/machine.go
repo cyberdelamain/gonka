@@ -3,6 +3,7 @@ package state
 import (
 	"bytes"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"maps"
 	"slices"
@@ -12,7 +13,6 @@ import (
 	"github.com/gtank/ristretto255"
 	"google.golang.org/protobuf/proto"
 
-	"common/completionapi"
 	"devshard/heightsync"
 	"devshard/logging"
 	"devshard/signing"
@@ -51,6 +51,9 @@ func tokenCost(a, b, price uint64) (uint64, error) {
 	}
 	return cost, nil
 }
+
+// MinReservationTokens is the smallest max_tokens a MsgStartInference may reserve.
+const MinReservationTokens = 1
 
 func ReservedCost(inputLength, maxTokens, tokenPrice uint64) (uint64, error) {
 	return tokenCost(inputLength, maxTokens, tokenPrice)
@@ -121,6 +124,7 @@ type StateMachine struct {
 	totalSlots         uint32
 
 	warmResolver WarmKeyResolver // optional, nil = no warm key support
+	headerTimes  HeaderTimeSource
 
 	heartbeatCfg    heightsync.HeartbeatConfig
 	turnTracker     *heightsync.TurnTracker
@@ -209,6 +213,10 @@ func WithVersion(version string) SMOption {
 // fields fall back to compiled defaults.
 func WithHeartbeatConfig(cfg heightsync.HeartbeatConfig) SMOption {
 	return func(sm *StateMachine) { sm.heartbeatCfg = cfg }
+}
+
+func WithHeaderTimes(src HeaderTimeSource) SMOption {
+	return func(sm *StateMachine) { sm.headerTimes = src }
 }
 
 // HeartbeatConfig is the log-plane config this machine was constructed with.
@@ -303,6 +311,9 @@ func NewStateMachine(
 	sm.liveEntrySum.Zero()
 	for _, o := range opts {
 		o(sm)
+	}
+	if sm.headerTimes == nil {
+		sm.headerTimes = fallbackHeaderTimes
 	}
 	sm.turnTracker = heightsync.NewTurnTracker(uint64(len(groupCopy)), 0, sm.heartbeatCfg)
 	sm.heightSyncFloor = heightsync.NewFloorIndex()
@@ -615,6 +626,10 @@ func (sm *StateMachine) localBestEffortJournaled(nonce uint64, txs []*types.Devs
 				return nil, nil, nil, err
 			}
 			logPlaneReject = err
+			continue
+		}
+		if err := sm.checkRaiseResolvableLocked(nonce, tx); err != nil {
+			logDroppedTx(nonce, tx, err)
 			continue
 		}
 		if err := sm.applyTxAtomicLocked(tx, nonce); err != nil {
@@ -946,7 +961,23 @@ func (sm *StateMachine) SnapshotState() types.EscrowState {
 func (sm *StateMachine) SnapshotStateNoInferences() types.EscrowState {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
-	src := sm.state
+	return snapshotNoInferencesLocked(sm.state)
+}
+
+// SnapshotWithInference copies the escrow summary and one inference record
+// under the same lock. The returned state has a nil inference map.
+func (sm *StateMachine) SnapshotWithInference(id uint64) (types.EscrowState, *types.InferenceRecord, bool) {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	st := snapshotNoInferencesLocked(sm.state)
+	rec, ok := sm.state.Inferences[id]
+	if !ok || rec == nil {
+		return st, nil, false
+	}
+	return st, copyInferenceRecord(rec), true
+}
+
+func snapshotNoInferencesLocked(src *types.EscrowState) types.EscrowState {
 	// Shallow struct copy; SealedAcc ([]byte) is shared deliberately: it is
 	// only ever replaced wholesale (append to a nil slice), never mutated in
 	// place, so readers of the snapshot see a stable value.
@@ -1189,8 +1220,8 @@ func (sm *StateMachine) applyStartInference(msg *types.MsgStartInference, diffNo
 
 	// A sub-floor reservation is refused by the executor's payload check, so the inference would sit
 	// pending until seal. Rejecting here keeps it out of state and off the balance.
-	if !sm.replayingPersisted && msg.MaxTokens < completionapi.MinTokensFloor {
-		return fmt.Errorf("%w: max_tokens %d, floor %d", types.ErrMaxTokensBelowFloor, msg.MaxTokens, completionapi.MinTokensFloor)
+	if !sm.replayingPersisted && msg.MaxTokens < MinReservationTokens {
+		return fmt.Errorf("%w: max_tokens %d, floor %d", types.ErrMaxTokensBelowFloor, msg.MaxTokens, MinReservationTokens)
 	}
 
 	// Duplicate inference ID guard.
@@ -1199,6 +1230,10 @@ func (sm *StateMachine) applyStartInference(msg *types.MsgStartInference, diffNo
 	}
 
 	anchor, err := sm.checkFloorStampLocked("start", diffNonce, msg.ObservedHeight, msg.ObservedBlockHash)
+	if err != nil {
+		return err
+	}
+	startedAtMs, err := sm.floorTimeMsLocked(anchor)
 	if err != nil {
 		return err
 	}
@@ -1226,6 +1261,7 @@ func (sm *StateMachine) applyStartInference(msg *types.MsgStartInference, diffNo
 		ReservedCost:       reservedCost,
 		StartedAtHeight:    anchor.Height,
 		StartedAtBlockHash: append([]byte(nil), anchor.Hash...),
+		StartedAtTimeMs:    startedAtMs,
 	}
 
 	sm.putInferenceLocked(msg.InferenceId, rec)
@@ -1259,9 +1295,14 @@ func (sm *StateMachine) applyConfirmStart(msg *types.MsgConfirmStart, diffNonce 
 	if err := sm.checkReceiptLocked(rec, msg, sm.hostSignerAllowedLocked); err != nil {
 		return err
 	}
+	confirmedAtMs, err := sm.floorTimeMsLocked(anchor)
+	if err != nil {
+		return err
+	}
 
 	rec.Status = types.StatusStarted
 	rec.ConfirmedAtHeight = anchor.Height
+	rec.ConfirmedAtTimeMs = confirmedAtMs
 	logging.Debug("inference pending -> started", "subsystem", "state",
 		"inference_id", msg.InferenceId,
 		"executor_slot", rec.ExecutorSlot,
@@ -1834,14 +1875,29 @@ func (sm *StateMachine) applyFinalizeRound() error {
 
 // settleLiveRecordLocked applies the deterministic settlement default to a
 // still-live inference at the Finalizing->Settlement drain.
-func (sm *StateMachine) settleLiveRecordLocked(rec *types.InferenceRecord, sealNonce uint64) {
+func (sm *StateMachine) liveTimeoutDueAtDrainLocked(rec *types.InferenceRecord, sealNonce uint64) (bool, error) {
+	if rec == nil {
+		return false, nil
+	}
+	reason := types.TimeoutReason_TIMEOUT_REASON_REFUSED
+	switch rec.Status {
+	case types.StatusPending:
+	case types.StatusStarted:
+		reason = types.TimeoutReason_TIMEOUT_REASON_EXECUTION
+	default:
+		return false, nil
+	}
+	remaining, err := sm.timeoutRemainingLocked(rec, reason, sealNonce)
+	if errors.Is(err, types.ErrHeaderPending) {
+		return false, err
+	}
+	return err == nil && remaining == 0, nil
+}
+
+func (sm *StateMachine) settleLiveRecordLocked(rec *types.InferenceRecord, timeoutDue bool) {
 	switch rec.Status {
 	case types.StatusStarted, types.StatusPending:
-		reason := types.TimeoutReason_TIMEOUT_REASON_REFUSED
-		if rec.Status == types.StatusStarted {
-			reason = types.TimeoutReason_TIMEOUT_REASON_EXECUTION
-		}
-		if remaining, err := sm.timeoutRemainingLocked(rec, reason, sealNonce); err != nil || remaining > 0 {
+		if !timeoutDue {
 			rec.Status = types.StatusTimedOut
 			sm.state.Balance += rec.ReservedCost
 			return

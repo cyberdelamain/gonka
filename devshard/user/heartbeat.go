@@ -251,7 +251,11 @@ func (s *Session) DriveTimeoutFloor(ctx context.Context) error {
 	}
 	s.mu.Lock()
 	now := time.Now()
-	if !s.lastTimeoutFloorRound.IsZero() && now.Sub(s.lastTimeoutFloorRound) < s.sm.BlocksToDuration(1) {
+	interval := s.sm.HeartbeatConfig().BlockTime
+	if interval <= 0 {
+		interval = heightsync.DefaultBlockTime
+	}
+	if !s.lastTimeoutFloorRound.IsZero() && now.Sub(s.lastTimeoutFloorRound) < interval {
 		s.mu.Unlock()
 		return nil
 	}

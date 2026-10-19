@@ -3,6 +3,7 @@ package state
 import (
 	"bytes"
 	"fmt"
+	"math"
 	"time"
 
 	"devshard/heightsync"
@@ -63,48 +64,69 @@ func checkStartStamp(rec *types.InferenceRecord, height uint64, hash []byte) err
 	return nil
 }
 
-func (sm *StateMachine) timeoutBlockTime() time.Duration {
-	if ms := sm.state.Config.TimeoutBlockTimeMs; ms > 0 {
-		return time.Duration(ms) * time.Millisecond
+func (sm *StateMachine) floorTimeMsLocked(p heightsync.FloorPoint) (int64, error) {
+	if p.Height == 0 {
+		return 0, nil
 	}
-	if sm.heartbeatCfg.BlockTime > 0 {
-		return sm.heartbeatCfg.BlockTime
+	if sm.headerTimes == nil {
+		return 0, fmt.Errorf("%w: no header time source for height %d", types.ErrHeaderPending, p.Height)
 	}
-	return heightsync.DefaultBlockTime
+	ms, err := sm.headerTimes.HeaderTimeMs(p.Height, p.Hash)
+	if err != nil {
+		return 0, err
+	}
+	if ms <= 0 {
+		return 0, fmt.Errorf("%w: height %d has no block time", types.ErrHeaderPending, p.Height)
+	}
+	return ms, nil
 }
 
-func (sm *StateMachine) timeoutBlocks(seconds int64) uint64 {
+func (sm *StateMachine) checkRaiseResolvableLocked(nonce uint64, tx *types.DevshardTx) error {
+	cur, _ := sm.heightSyncFloor.Max()
+	for _, c := range floorClaims(sm.state, []*types.DevshardTx{tx}) {
+		if c.Signer == heightsync.SequencerSigner || c.Height <= cur || !heightsync.StampPresent(c.Hash) {
+			continue
+		}
+		if _, err := sm.floorTimeMsLocked(heightsync.FloorPoint{Height: c.Height, Hash: c.Hash}); err != nil {
+			return fmt.Errorf("floor claim %d at nonce %d: %w", c.Height, nonce, err)
+		}
+	}
+	return nil
+}
+
+func secondsToMs(seconds int64) int64 {
 	if seconds <= 0 {
 		return 0
 	}
-	blockTime := sm.timeoutBlockTime()
-	d := time.Duration(seconds) * time.Second
-	return uint64((d + blockTime - 1) / blockTime)
+	if seconds > math.MaxInt64/1000 {
+		return math.MaxInt64
+	}
+	return seconds * 1000
 }
 
-func (sm *StateMachine) timeoutWindowLocked(rec *types.InferenceRecord, reason types.TimeoutReason) (anchor, blocks uint64, err error) {
+func (sm *StateMachine) timeoutWindowLocked(rec *types.InferenceRecord, reason types.TimeoutReason) (anchorMs, windowMs int64, err error) {
 	switch reason {
 	case types.TimeoutReason_TIMEOUT_REASON_REFUSED:
 		if rec.Status != types.StatusPending {
 			return 0, 0, fmt.Errorf("%w: reason=refused requires pending, got %d", types.ErrInvalidTimeoutReason, rec.Status)
 		}
-		anchor, blocks = rec.StartedAtHeight, sm.timeoutBlocks(sm.state.Config.RefusalTimeout)
+		anchorMs, windowMs = rec.StartedAtTimeMs, secondsToMs(sm.state.Config.RefusalTimeout)
 	case types.TimeoutReason_TIMEOUT_REASON_EXECUTION:
 		if rec.Status != types.StatusStarted {
 			return 0, 0, fmt.Errorf("%w: reason=execution requires started, got %d", types.ErrInvalidTimeoutReason, rec.Status)
 		}
-		anchor, blocks = rec.ConfirmedAtHeight, sm.timeoutBlocks(sm.state.Config.ExecutionTimeout)
+		anchorMs, windowMs = rec.ConfirmedAtTimeMs, secondsToMs(sm.state.Config.ExecutionTimeout)
 	default:
 		return 0, 0, fmt.Errorf("%w: unknown reason %v", types.ErrInvalidTimeoutReason, reason)
 	}
-	if anchor == 0 {
+	if anchorMs <= 0 {
 		return 0, 0, fmt.Errorf("%w: reason=%s", types.ErrTimeoutNotArmed, reason)
 	}
-	return anchor, blocks, nil
+	return anchorMs, windowMs, nil
 }
 
-func (sm *StateMachine) timeoutRemainingLocked(rec *types.InferenceRecord, reason types.TimeoutReason, nonce uint64) (uint64, error) {
-	anchor, blocks, err := sm.timeoutWindowLocked(rec, reason)
+func (sm *StateMachine) timeoutRemainingLocked(rec *types.InferenceRecord, reason types.TimeoutReason, nonce uint64) (time.Duration, error) {
+	anchorMs, windowMs, err := sm.timeoutWindowLocked(rec, reason)
 	if err != nil {
 		return 0, err
 	}
@@ -112,11 +134,15 @@ func (sm *StateMachine) timeoutRemainingLocked(rec *types.InferenceRecord, reaso
 	if err != nil {
 		return 0, err
 	}
-	due := addSatUint64(anchor, blocks)
-	if p.Height >= due {
+	nowMs, err := sm.floorTimeMsLocked(p)
+	if err != nil {
+		return 0, err
+	}
+	elapsed := nowMs - anchorMs
+	if elapsed >= windowMs {
 		return 0, nil
 	}
-	return due - p.Height, nil
+	return time.Duration(windowMs-elapsed) * time.Millisecond, nil
 }
 
 func (sm *StateMachine) checkTimeoutDueLocked(rec *types.InferenceRecord, reason types.TimeoutReason, nonce uint64) error {
@@ -125,12 +151,12 @@ func (sm *StateMachine) checkTimeoutDueLocked(rec *types.InferenceRecord, reason
 		return err
 	}
 	if remaining > 0 {
-		return fmt.Errorf("%w: reason=%s needs %d more blocks at nonce %d", types.ErrTimeoutNotDue, reason, remaining, nonce)
+		return fmt.Errorf("%w: reason=%s needs %s more block time at nonce %d", types.ErrTimeoutNotDue, reason, remaining, nonce)
 	}
 	return nil
 }
 
-func (sm *StateMachine) TimeoutRemaining(inferenceID uint64, reason types.TimeoutReason) (uint64, error) {
+func (sm *StateMachine) TimeoutRemaining(inferenceID uint64, reason types.TimeoutReason) (time.Duration, error) {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
 	rec, ok := sm.state.Inferences[inferenceID]
@@ -148,31 +174,4 @@ func (sm *StateMachine) TimeoutDue(inferenceID uint64, reason types.TimeoutReaso
 		return fmt.Errorf("%w: inference %d", types.ErrInferenceNotFound, inferenceID)
 	}
 	return sm.checkTimeoutDueLocked(rec, reason, sm.state.LatestNonce+1)
-}
-
-func (sm *StateMachine) TimeoutDueHeight(inferenceID uint64, reason types.TimeoutReason) (uint64, error) {
-	sm.mu.RLock()
-	defer sm.mu.RUnlock()
-	rec, ok := sm.state.Inferences[inferenceID]
-	if !ok {
-		return 0, fmt.Errorf("%w: inference %d", types.ErrInferenceNotFound, inferenceID)
-	}
-	anchor, blocks, err := sm.timeoutWindowLocked(rec, reason)
-	if err != nil {
-		return 0, err
-	}
-	return addSatUint64(anchor, blocks), nil
-}
-
-func (sm *StateMachine) BlocksToDuration(n uint64) time.Duration {
-	sm.mu.RLock()
-	defer sm.mu.RUnlock()
-	return time.Duration(n) * sm.timeoutBlockTime()
-}
-
-func addSatUint64(a, b uint64) uint64 {
-	if a > ^uint64(0)-b {
-		return ^uint64(0)
-	}
-	return a + b
 }

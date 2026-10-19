@@ -804,22 +804,46 @@ a real block, so even a user-originated stamp is checkable while
 
 #### 10.5.2 Consequence — timeouts and seals can leave wall time
 
-`observed_height` in the log plus the derived record heights make it
-possible to express in-session deadlines in blocks rather than in each
-verifier's local clock:
+`observed_height` in the log plus the derived record anchors make it
+possible to express in-session deadlines against the chain's own clock
+rather than each verifier's local clock. A floor point `(H, hash)` names
+exactly one block, and that block's header carries its BFT time. The time
+is taken from the verifier's own chain view, and only once that header's
+hash equals the floor hash:
 
-| Decision | Wall-clock form | Height form |
-| -------- | --------------- | ----------- |
-| Execution timeout | `now − confirmed_at ≥ ExecutionTimeout`, evaluated against the verifier's own clock | `h_local − confirmed_at_height ≥ ExecutionTimeoutBlocks` |
-| Refusal timeout | `now − started_at`, where `started_at` is user-controlled and unverifiable | `h − started_at_height`, now checkable via L6 |
-| Deterministic seal clock | max `confirmed_at` over the recent confirmed window | max `confirmed_at_height` — a chain-verifiable logical clock |
+| Decision | Wall-clock form | Header-time form |
+| -------- | --------------- | ---------------- |
+| Refusal timeout | `now − started_at`, where `started_at` is user-controlled and unverifiable | `time(F(m)) − time(start anchor) ≥ RefusalTimeout` |
+| Execution timeout | `now − confirmed_at ≥ ExecutionTimeout`, evaluated against the verifier's own clock | `time(F(m)) − time(confirm anchor) ≥ ExecutionTimeout` |
+| Deterministic seal clock | max `confirmed_at` over the recent confirmed window | max confirm-anchor block time; Finished records seal once `clock − time(confirm anchor) ≥ InferenceSealGraceSeconds + ExecutionTimeout` |
+
+`m` is the nonce the timeout applies at. The record stores both the
+anchor height and the anchor's block time (`started_at_time_ms`,
+`confirmed_at_time_ms`), so a timeout check reads only `time(F(m))`.
+
+A block count is deliberately not used. Mainnet block intervals are
+bimodal (about 2.5 s and 5.5 s) and stall for minutes around upgrades, so
+any fixed `BlockTime` either fires early or late, and a halted chain adds
+no blocks while real time passes.
+
+Header availability is part of the rule:
+
+- A floor height the verifier's chain has not produced yet gives no time.
+  The diff waits (`ErrHeaderPending`) and is retried; it is never judged
+  INVALID for it, and no block interval is substituted. A host behind by
+  a block waits for its node.
+- A floor hash that is not the canonical block at that height is rejected
+  (`ErrHeaderMismatch`).
+- The sequencer does not put a floor raise into a diff unless its own
+  chain view can prove that `(H, hash)`. A fabricated future height
+  therefore never becomes a floor an honest party has to read a time for.
+- Settlement computes every live record's timeout before draining. A
+  pending header defers the drain rather than refunding.
 
 This is the §1 motivation applied inward: a deadline that depends on each
-host's clock cannot be agreed on, a height can. Migration is deliberately
-two-step — a deployment first **carries** the heights, and only later
-**switches** decisions onto them, because any decision that folds into a
-state root must change under a version gate rather than a runtime flag,
-or two participants compute different roots.
+host's clock cannot be agreed on, a block's header time can. Any decision
+that folds into a state root changes under a version gate rather than a
+runtime flag, or two participants compute different roots.
 
 ### 10.6 Asynchronous fan-out — the turn is pipelined, never serialized
 
@@ -2326,7 +2350,7 @@ the test scenario that proves it (full catalog in
 | **Peer sync status + repair probe** (§11): `sync_vector`, `sync_state`, `peer_seen`, `POST /sessions/:id/heightsync/repair` | 📋 | proposed here. Rides the existing `devshard/gossip` peer client and host mempool; no new transport. |
 | **Close-ready arming** (§12): `CloseReadyView`, `UserTimeoutEvidence` | 📋 | proposed here. Consumer is `finalization.md`; nothing in this layer votes. Missing acks are not cheating evidence (§11.3). |
 | `observed_height` stamps on `MsgStartInference` / `MsgConfirmStart` / `MsgFinishInference` | 📋 | RECOMMENDED (§10.5). Optional migration step: without it the protocol is correct but emits more heartbeats. `MsgConfirmStart` additionally requires the `ExecutorReceiptContent` mirror (§10.5.1) or its height is not a host attestation. |
-| Derived record heights + moving timeouts / seal clock off wall time | 📋 | §10.5.2. Two-step by construction: carry the heights first, switch the decisions later under a version gate, since the seal clock folds into the state root. |
+| Derived record anchors + timeouts / seal clock on header time | ✅ | §10.5.2. Records carry anchor heights and block times. Refusal, execution and seal decisions read `time(F(m))` from the verifier's own chain view. Not wire- or state-compatible with v6. |
 | On-chain `MsgHeightSyncEvidence` + slashing tx | ⏸ | dispute / cPoC owns. |
 | Floor garbage cleanup after L6 | ⏸ | Phase F / dispute layer. L6 is attribution only; a garbage pair that became `F` stays `F` until cleanup (§14). Slash does not restore the clock. |
 | Gateway chain follower opt-in (`DEVSHARD_GATEWAY_CHAIN_ORACLE`) | ✅ | Spec §6. Follower off by default (`true`/`1`/`on`). Wired as `HeightSyncLogOracle` only; scheduler always `PeerTipOracleSource`; seed still required. Tests H105–H108. |

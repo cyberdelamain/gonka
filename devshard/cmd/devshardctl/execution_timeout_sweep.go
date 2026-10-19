@@ -14,8 +14,7 @@ const (
 )
 
 type timeoutClock interface {
-	TimeoutRemaining(inferenceID uint64, reason types.TimeoutReason) (uint64, error)
-	BlocksToDuration(n uint64) time.Duration
+	TimeoutRemaining(inferenceID uint64, reason types.TimeoutReason) (time.Duration, error)
 }
 
 // overdueTimeoutInferences returns nonces whose timeout would pass the state

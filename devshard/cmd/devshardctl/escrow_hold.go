@@ -65,7 +65,7 @@ func summarizeEscrowHoldInFlight(inferences map[uint64]*types.InferenceRecord, c
 			summary.pendingCount++
 			summary.pendingCost += inference.ReservedCost
 			remaining, err := clock.TimeoutRemaining(nonce, types.TimeoutReason_TIMEOUT_REASON_REFUSED)
-			deadline := now.Add(clock.BlocksToDuration(remaining))
+			deadline := now.Add(remaining)
 			if err != nil && !errors.Is(err, types.ErrTimeoutNotArmed) {
 				continue
 			}

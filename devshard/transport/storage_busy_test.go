@@ -73,6 +73,19 @@ func TestIsStorageBusy(t *testing.T) {
 	require.False(t, IsStorageBusy(errors.New("storage_busy")))
 }
 
+func TestIsHeaderPending(t *testing.T) {
+	pending := &UpstreamStatusError{StatusCode: http.StatusServiceUnavailable, DevshardError: DevshardErrorHeaderPending}
+	require.True(t, IsHeaderPending(pending))
+	require.True(t, IsRetryableNonInference(pending))
+	require.False(t, IsStorageBusy(pending))
+	require.False(t, IsHeaderPending(&UpstreamStatusError{StatusCode: http.StatusServiceUnavailable, DevshardError: DevshardErrorStorageBusy}))
+
+	ce := connect.NewError(connect.CodeUnavailable, errors.New("pending"))
+	ce.Meta().Set(HeaderDevshardError, DevshardErrorHeaderPending)
+	require.True(t, IsHeaderPending(ce))
+	require.True(t, IsRetryableNonInference(ce))
+}
+
 // cancelAwareEngine records whether its context was canceled while it ran.
 type cancelAwareEngine struct {
 	inner    *stub.InferenceEngine

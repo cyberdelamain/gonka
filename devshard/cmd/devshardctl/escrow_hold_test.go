@@ -281,18 +281,14 @@ func TestGatewayCheckBalancesKeepsAHeldEscrowWhoseStartedReservationTheSweepCanR
 	require.Equal(t, "on_hold", reason)
 }
 
-type fakeTimeoutClock map[uint64]uint64
+type fakeTimeoutClock map[uint64]time.Duration
 
-func (c fakeTimeoutClock) TimeoutRemaining(id uint64, _ types.TimeoutReason) (uint64, error) {
+func (c fakeTimeoutClock) TimeoutRemaining(id uint64, _ types.TimeoutReason) (time.Duration, error) {
 	remaining, armed := c[id]
 	if !armed {
 		return 0, types.ErrTimeoutNotArmed
 	}
 	return remaining, nil
-}
-
-func (fakeTimeoutClock) BlocksToDuration(n uint64) time.Duration {
-	return time.Duration(n) * time.Second
 }
 
 // Test flow:
@@ -302,7 +298,7 @@ func (fakeTimeoutClock) BlocksToDuration(n uint64) time.Duration {
 //  4. Started and disputed money always counts as recoverable; overdue Pending money counts only while a vote may still be running.
 func TestSummarizeEscrowHoldInFlightCountsEachStatusAndItsDeadline(t *testing.T) {
 	now := time.Unix(10_000, 0)
-	clock := fakeTimeoutClock{1: 60, 2: 0, 4: 120}
+	clock := fakeTimeoutClock{1: 60 * time.Second, 2: 0, 4: 120 * time.Second}
 	inferences := map[uint64]*types.InferenceRecord{
 		1: {Status: types.StatusPending, ReservedCost: 10},
 		2: {Status: types.StatusPending, ReservedCost: 30},

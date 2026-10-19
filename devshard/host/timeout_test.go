@@ -8,6 +8,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"devshard"
 	"devshard/internal/testutil"
 	"devshard/signing"
 	"devshard/state"
@@ -72,6 +73,10 @@ type mockExecutorClient struct {
 
 func (m *mockExecutorClient) GetMempool(_ context.Context) ([]*types.DevshardTx, error) {
 	return m.mempool, m.mempoolErr
+}
+
+func (m *mockExecutorClient) ChallengeCatchUp(context.Context, uint64, []types.DiffWire, string) error {
+	return m.challengeReceiptErr
 }
 
 func (m *mockExecutorClient) ChallengeReceipt(_ context.Context, _ uint64, payload *InferencePayload, diffs []types.Diff) ([]byte, []*types.DevshardTx, error) {
@@ -163,7 +168,7 @@ func TestVerifyRefused_ReceiptInLocalMempool(t *testing.T) {
 	g := newEvidenceGroup(t)
 	confirm, _ := signedConfirm(t, g.signers[1], st.EscrowID, st, 1, 2000)
 
-	accept, err := VerifyRefusedTimeout(context.Background(), st, 1, testPayload(), []*types.DevshardTx{confirm}, nil, nil, due(g.sm))
+	accept, err := VerifyRefusedTimeout(context.Background(), st, 1, st.Inferences[1], testPayload(), []*types.DevshardTx{confirm}, nil, nil, due(g.sm))
 	require.NoError(t, err)
 	require.False(t, accept, "should reject: verified receipt in local mempool")
 }
@@ -176,7 +181,7 @@ func TestVerifyRefused_UnsignedLocalEvidenceDoesNotReject(t *testing.T) {
 		{Tx: &types.DevshardTx_FinishInference{FinishInference: &types.MsgFinishInference{InferenceId: 1, EscrowId: st.EscrowID, ExecutorSlot: 1}}},
 	}
 
-	accept, err := VerifyRefusedTimeout(context.Background(), st, 1, testPayload(), mempool, nil, nil, due(g.sm))
+	accept, err := VerifyRefusedTimeout(context.Background(), st, 1, st.Inferences[1], testPayload(), mempool, nil, nil, due(g.sm))
 	require.NoError(t, err)
 	require.True(t, accept, "unverified local txs must not reject the timeout")
 }
@@ -193,7 +198,7 @@ func TestVerifyRefused_ChallengeErrorAcceptsTimeout(t *testing.T) {
 			st := stateWithPendingFull(1, 1)
 			executor := &mockExecutorClient{challengeReceiptErr: tc.err}
 
-			accept, err := VerifyRefusedTimeout(context.Background(), st, 1, testPayload(), nil, executor, nil, due(newEvidenceGroup(t).sm))
+			accept, err := VerifyRefusedTimeout(context.Background(), st, 1, st.Inferences[1], testPayload(), nil, executor, nil, due(newEvidenceGroup(t).sm))
 			require.NoError(t, err)
 			require.True(t, accept, "challenge error should be treated as executor unreachable")
 		})
@@ -214,7 +219,7 @@ func TestVerifyRefused_ChallengesOnceWithoutDiffs(t *testing.T) {
 			st.LatestNonce = 100_000
 			executor := &mockExecutorClient{challengeReceipt: tc.receipt}
 
-			accept, err := VerifyRefusedTimeout(context.Background(), st, 1, testPayload(), nil, executor, nil, due(newEvidenceGroup(t).sm))
+			accept, err := VerifyRefusedTimeout(context.Background(), st, 1, st.Inferences[1], testPayload(), nil, executor, nil, due(newEvidenceGroup(t).sm))
 			require.NoError(t, err)
 			require.Equal(t, tc.accept, accept)
 			require.Equal(t, [][]types.Diff{nil}, executor.challengePages, "the executor answers from its own state")
@@ -228,7 +233,7 @@ func TestVerifyRefused_ReceiptWithoutQueuedConfirmDoesNotReject(t *testing.T) {
 	_, sig := signedConfirm(t, g.signers[1], st.EscrowID, st, 1, 2000)
 	executor := &mockExecutorClient{challengeReceipt: sig}
 
-	accept, err := VerifyRefusedTimeout(context.Background(), st, 1, testPayload(), nil, executor, nil, due(g.sm))
+	accept, err := VerifyRefusedTimeout(context.Background(), st, 1, st.Inferences[1], testPayload(), nil, executor, nil, due(g.sm))
 	require.NoError(t, err)
 	require.True(t, accept, "a receipt is checked against the ConfirmStart it signs")
 }
@@ -236,7 +241,7 @@ func TestVerifyRefused_ReceiptWithoutQueuedConfirmDoesNotReject(t *testing.T) {
 func TestVerifyRefused_InferenceNotPending(t *testing.T) {
 	st := stateWithStarted(1, 1) // started, not pending
 
-	_, err := VerifyRefusedTimeout(context.Background(), st, 1, nil, nil, nil, nil, due(nil))
+	_, err := VerifyRefusedTimeout(context.Background(), st, 1, st.Inferences[1], nil, nil, nil, nil, due(nil))
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "expected pending")
 }
@@ -244,7 +249,7 @@ func TestVerifyRefused_InferenceNotPending(t *testing.T) {
 func TestVerifyRefused_DeadlineNotPassed(t *testing.T) {
 	st := stateWithPendingFull(1, 1)
 
-	accept, err := VerifyRefusedTimeout(context.Background(), st, 1, testPayload(), nil, nil, nil, notDue(nil))
+	accept, err := VerifyRefusedTimeout(context.Background(), st, 1, st.Inferences[1], testPayload(), nil, nil, nil, notDue(nil))
 	require.NoError(t, err)
 	require.False(t, accept, "should reject: deadline not passed")
 }
@@ -254,7 +259,7 @@ func TestVerifyRefused_NilPayload_Rejects(t *testing.T) {
 	executor := &mockExecutorClient{challengeReceipt: []byte("would-return-receipt")}
 
 	// Nil payload -> decline (accept=false, no error), same as the bad-payload branch.
-	accept, err := VerifyRefusedTimeout(context.Background(), st, 1, nil, nil, executor, nil, due(nil))
+	accept, err := VerifyRefusedTimeout(context.Background(), st, 1, st.Inferences[1], nil, nil, executor, nil, due(nil))
 	require.NoError(t, err)
 	require.False(t, accept, "should reject: nil payload")
 }
@@ -267,7 +272,7 @@ func TestVerifyRefused_PayloadMismatch_Rejects(t *testing.T) {
 	badPayload := testPayload()
 	badPayload.Model = "wrong-model"
 
-	accept, err := VerifyRefusedTimeout(context.Background(), st, 1, badPayload, nil, executor, nil, due(nil))
+	accept, err := VerifyRefusedTimeout(context.Background(), st, 1, st.Inferences[1], badPayload, nil, executor, nil, due(nil))
 	require.NoError(t, err)
 	require.False(t, accept, "should reject: payload mismatch")
 }
@@ -279,7 +284,7 @@ func TestVerifyRefused_FinishWithoutConfirmDoesNotReject(t *testing.T) {
 	g := newEvidenceGroup(t)
 	mempool := []*types.DevshardTx{signedFinish(t, g.signers[1], st.EscrowID, 1, 1)}
 
-	accept, err := VerifyRefusedTimeout(context.Background(), st, 1, testPayload(), mempool, nil, nil, due(g.sm))
+	accept, err := VerifyRefusedTimeout(context.Background(), st, 1, st.Inferences[1], testPayload(), mempool, nil, nil, due(g.sm))
 	require.NoError(t, err)
 	require.True(t, accept, "a finish alone in the local mempool must not block the refusal")
 }
@@ -300,7 +305,7 @@ func TestVerifyRefused_CopiesVerifiedReceipt(t *testing.T) {
 	}
 	verifierPool := NewMempool()
 
-	accept, err := VerifyRefusedTimeout(context.Background(), st, 1, testPayload(), nil, executor, verifierPool, due(g.sm))
+	accept, err := VerifyRefusedTimeout(context.Background(), st, 1, st.Inferences[1], testPayload(), nil, executor, verifierPool, due(g.sm))
 	require.NoError(t, err)
 	require.False(t, accept, "a receipt signed by the executor for this escrow must reject the timeout")
 
@@ -315,7 +320,7 @@ func TestVerifyRefused_CopiesVerifiedReceipt(t *testing.T) {
 	require.ElementsMatch(t, []uint64{types.TxHash(confirm), types.TxHash(finish)}, copied,
 		"only the verified ConfirmStart and Finish are copied")
 
-	accept, err = VerifyRefusedTimeout(context.Background(), st, 1, testPayload(), nil, executor, verifierPool, due(g.sm))
+	accept, err = VerifyRefusedTimeout(context.Background(), st, 1, st.Inferences[1], testPayload(), nil, executor, verifierPool, due(g.sm))
 	require.NoError(t, err)
 	require.False(t, accept)
 	require.Len(t, verifierPool.Txs(), 2, "second challenge must not stack copies")
@@ -336,7 +341,7 @@ func TestVerifyRefused_ReceiptForOtherEscrowOrSignerDoesNotReject(t *testing.T) 
 			executor := &mockExecutorClient{challengeReceipt: sig, challengeMempool: []*types.DevshardTx{confirm}}
 			pool := NewMempool()
 
-			accept, err := VerifyRefusedTimeout(context.Background(), st, 1, testPayload(), nil, executor, pool, due(g.sm))
+			accept, err := VerifyRefusedTimeout(context.Background(), st, 1, st.Inferences[1], testPayload(), nil, executor, pool, due(g.sm))
 			require.NoError(t, err)
 			require.True(t, accept)
 			require.Empty(t, pool.Txs())
@@ -351,7 +356,7 @@ func TestVerifyExecution_FinishInLocalMempool(t *testing.T) {
 	g := newEvidenceGroup(t)
 	mempool := []*types.DevshardTx{signedFinish(t, g.signers[1], st.EscrowID, 1, 1)}
 
-	accept, err := VerifyExecutionTimeout(context.Background(), st, 1, mempool, nil, nil, due(g.sm))
+	accept, err := VerifyExecutionTimeout(context.Background(), st, 1, st.Inferences[1], mempool, nil, nil, due(g.sm))
 	require.NoError(t, err)
 	require.False(t, accept, "should reject: verified finish in local mempool")
 }
@@ -362,7 +367,7 @@ func TestVerifyExecution_StubFinishDoesNotReject(t *testing.T) {
 	stub := &types.DevshardTx{Tx: &types.DevshardTx_FinishInference{FinishInference: &types.MsgFinishInference{InferenceId: 1}}}
 	executor := &mockExecutorClient{challengeMempool: []*types.DevshardTx{stub}}
 
-	accept, err := VerifyExecutionTimeout(context.Background(), st, 1, []*types.DevshardTx{stub}, executor, nil, due(g.sm))
+	accept, err := VerifyExecutionTimeout(context.Background(), st, 1, st.Inferences[1], []*types.DevshardTx{stub}, executor, nil, due(g.sm))
 	require.NoError(t, err)
 	require.True(t, accept, "a finish with only InferenceId must not reject the timeout")
 	require.Nil(t, executor.challengePayload, "execution timeout must not ask the executor to run")
@@ -379,7 +384,7 @@ func TestVerifyExecution_SignedFinishRejects(t *testing.T) {
 	executor := &mockExecutorClient{challengeMempool: []*types.DevshardTx{confirm, stub, finish}}
 	pool := NewMempool()
 
-	accept, err := VerifyExecutionTimeout(context.Background(), st, 1, nil, executor, pool, due(g.sm))
+	accept, err := VerifyExecutionTimeout(context.Background(), st, 1, st.Inferences[1], nil, executor, pool, due(g.sm))
 	require.NoError(t, err)
 	require.False(t, accept, "a finish signed by the executor for this escrow must reject the timeout")
 	got := pool.Txs()
@@ -399,7 +404,7 @@ func TestVerifyExecution_FinishForOtherEscrowOrSlotDoesNotReject(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			executor := &mockExecutorClient{challengeMempool: []*types.DevshardTx{finish}}
-			accept, err := VerifyExecutionTimeout(context.Background(), st, 1, nil, executor, nil, due(g.sm))
+			accept, err := VerifyExecutionTimeout(context.Background(), st, 1, st.Inferences[1], nil, executor, nil, due(g.sm))
 			require.NoError(t, err)
 			require.True(t, accept)
 		})
@@ -418,7 +423,7 @@ func TestVerifyExecution_OtherSlotFinishesDoNotHideAValidOne(t *testing.T) {
 	pool = append(pool, signedFinish(t, g.signers[1], st.EscrowID, 1, 1))
 	executor := &mockExecutorClient{challengeMempool: pool}
 
-	accept, err := VerifyExecutionTimeout(context.Background(), st, 1, nil, executor, nil, due(g.sm))
+	accept, err := VerifyExecutionTimeout(context.Background(), st, 1, st.Inferences[1], nil, executor, nil, due(g.sm))
 	require.NoError(t, err)
 	require.False(t, accept)
 }
@@ -438,7 +443,7 @@ func TestVerifyExecution_BoundsSignatureChecks(t *testing.T) {
 	counter := &countingEvidence{EvidenceVerifier: g.sm}
 	executor := &mockExecutorClient{challengeMempool: pool}
 
-	accept, err := VerifyExecutionTimeout(context.Background(), st, 1, nil, executor, nil, due(counter))
+	accept, err := VerifyExecutionTimeout(context.Background(), st, 1, st.Inferences[1], nil, executor, nil, due(counter))
 	require.NoError(t, err)
 	require.True(t, accept)
 	require.Equal(t, maxEvidenceChecks, counter.finishes)
@@ -457,7 +462,7 @@ func TestVerifyExecution_ShortHashFinishDoesNotReject(t *testing.T) {
 	}}
 	pool := NewMempool()
 
-	accept, err := VerifyExecutionTimeout(context.Background(), st, 1, nil, executor, pool, due(g.sm))
+	accept, err := VerifyExecutionTimeout(context.Background(), st, 1, st.Inferences[1], nil, executor, pool, due(g.sm))
 	require.NoError(t, err)
 	require.True(t, accept, "a signed finish that apply would reject must not block the timeout")
 	require.Empty(t, pool.Txs())
@@ -477,7 +482,7 @@ func TestVerifyExecution_OverflowingTokenCostDoesNotReject(t *testing.T) {
 	}}
 	pool := NewMempool()
 
-	accept, err := VerifyExecutionTimeout(context.Background(), st, 1, nil, executor, pool, due(g.sm))
+	accept, err := VerifyExecutionTimeout(context.Background(), st, 1, st.Inferences[1], nil, executor, pool, due(g.sm))
 	require.NoError(t, err)
 	require.True(t, accept, "a signed finish apply would reject for cost overflow must not block the timeout")
 	require.Empty(t, pool.Txs())
@@ -493,7 +498,7 @@ func TestVerifyExecution_WarmKeyFinishRejectsWithoutBinding(t *testing.T) {
 	executorAddr = g.signers[1].Address()
 	executor := &mockExecutorClient{challengeMempool: []*types.DevshardTx{signedFinish(t, warm, st.EscrowID, 1, 1)}}
 
-	accept, err := VerifyExecutionTimeout(context.Background(), st, 1, nil, executor, nil, due(g.sm))
+	accept, err := VerifyExecutionTimeout(context.Background(), st, 1, st.Inferences[1], nil, executor, nil, due(g.sm))
 	require.NoError(t, err)
 	require.False(t, accept, "a finish signed by the executor's warm key rejects the timeout")
 	require.Empty(t, g.sm.WarmKeys(), "challenge evidence must not write a warm binding into hashed state")
@@ -503,7 +508,7 @@ func TestVerifyExecution_ChallengesOnceWithoutDiffs(t *testing.T) {
 	st := stateWithStarted(1, 1)
 	executor := &mockExecutorClient{}
 
-	accept, err := VerifyExecutionTimeout(context.Background(), st, 1, nil, executor, nil, due(nil))
+	accept, err := VerifyExecutionTimeout(context.Background(), st, 1, st.Inferences[1], nil, executor, nil, due(nil))
 	require.NoError(t, err)
 	require.True(t, accept)
 	require.Nil(t, executor.challengePayload)
@@ -515,7 +520,7 @@ func TestVerifyExecution_ExecutorUnreachable_DeadlinePassed(t *testing.T) {
 	st := stateWithStarted(1, 1)
 	executor := &mockExecutorClient{challengeReceiptErr: errors.New("unreachable")}
 
-	accept, err := VerifyExecutionTimeout(context.Background(), st, 1, nil, executor, nil, due(nil))
+	accept, err := VerifyExecutionTimeout(context.Background(), st, 1, st.Inferences[1], nil, executor, nil, due(nil))
 	require.NoError(t, err)
 	require.True(t, accept, "should accept: executor unreachable")
 }
@@ -523,7 +528,7 @@ func TestVerifyExecution_ExecutorUnreachable_DeadlinePassed(t *testing.T) {
 func TestVerifyExecution_InferenceNotStarted(t *testing.T) {
 	st := stateWithPending(1, 1) // pending, not started
 
-	_, err := VerifyExecutionTimeout(context.Background(), st, 1, nil, nil, nil, due(nil))
+	_, err := VerifyExecutionTimeout(context.Background(), st, 1, st.Inferences[1], nil, nil, nil, due(nil))
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "expected started")
 }
@@ -531,7 +536,7 @@ func TestVerifyExecution_InferenceNotStarted(t *testing.T) {
 func TestVerifyExecution_NilExecutorClient(t *testing.T) {
 	st := stateWithStarted(1, 1)
 
-	accept, err := VerifyExecutionTimeout(context.Background(), st, 1, nil, nil, nil, due(nil))
+	accept, err := VerifyExecutionTimeout(context.Background(), st, 1, st.Inferences[1], nil, nil, nil, due(nil))
 	require.NoError(t, err)
 	require.True(t, accept, "should accept: no executor client (unreachable)")
 }
@@ -539,7 +544,7 @@ func TestVerifyExecution_NilExecutorClient(t *testing.T) {
 func TestVerifyExecution_DeadlineNotPassed(t *testing.T) {
 	st := stateWithStarted(1, 1)
 
-	accept, err := VerifyExecutionTimeout(context.Background(), st, 1, nil, nil, nil, notDue(nil))
+	accept, err := VerifyExecutionTimeout(context.Background(), st, 1, st.Inferences[1], nil, nil, nil, notDue(nil))
 	require.NoError(t, err)
 	require.False(t, accept, "should reject: deadline not passed")
 }
@@ -586,4 +591,22 @@ func due(ev EvidenceVerifier) EvidenceVerifier { return dueEvidence{inner: ev} }
 
 func notDue(ev EvidenceVerifier) EvidenceVerifier {
 	return dueEvidence{inner: ev, due: types.ErrTimeoutNotDue}
+}
+
+// Test flow:
+// 1. Record a pending inference reserved at max_tokens 8 with a matching payload.
+// 2. With the refusal due at the floor, VerifyRefusedTimeout accepts the refusal.
+func TestVerifyRefused_ShortReservationAccepted(t *testing.T) {
+	prompt := []byte(`{"model":"llama","messages":[{"role":"user","content":"hi"}],"max_tokens":8}`)
+	promptHash, err := devshard.CanonicalPromptHash(prompt)
+	require.NoError(t, err)
+	payload := &InferencePayload{Prompt: prompt, Model: "llama", InputLength: uint64(len(prompt)), MaxTokens: 8}
+
+	st := stateWithPendingFull(1, 1)
+	rec := st.Inferences[1]
+	rec.PromptHash, rec.InputLength, rec.MaxTokens = promptHash, uint64(len(prompt)), 8
+
+	accept, err := VerifyRefusedTimeout(context.Background(), st, 1, rec, payload, nil, nil, nil, due(newEvidenceGroup(t).sm))
+	require.NoError(t, err)
+	require.True(t, accept)
 }

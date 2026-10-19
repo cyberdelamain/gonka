@@ -32,8 +32,9 @@ type headerRPC interface {
 // NewBlock). At() is the last tipcache.HistoryWindow heights, then Comet
 // Header RPC (LoadBlockMeta — not Block / LoadBlock).
 type Oracle struct {
-	rpc   headerRPC
-	cache *tipcache.Cache
+	rpc     headerRPC
+	cache   *tipcache.Cache
+	history *History
 }
 
 // NewTendermint builds an Oracle against cfg.RPCURL. It does not start a
@@ -51,8 +52,9 @@ func NewTendermint(cfg TendermintConfig) (*Oracle, error) {
 
 func newOracle(rpc headerRPC) *Oracle {
 	return &Oracle{
-		rpc:   rpc,
-		cache: tipcache.New(0),
+		rpc:     rpc,
+		cache:   tipcache.New(0),
+		history: NewHistory(0),
 	}
 }
 
@@ -62,6 +64,7 @@ func (o *Oracle) Observe(h *blocks.Header) {
 		return
 	}
 	o.cache.Observe(h)
+	o.history.Put(h)
 }
 
 // ObserveHex decodes a hex block hash (Comet WS block_id.hash) and Observes.
@@ -96,7 +99,36 @@ func (o *Oracle) At(ctx context.Context, height int64) (*blocks.Header, error) {
 	if err == nil && h != nil {
 		return h, nil
 	}
+	if h, ok := o.history.Get(height); ok {
+		return h, nil
+	}
+	if h, ok := o.fetchBatch(ctx, height); ok {
+		return h, nil
+	}
 	return o.fetchHeader(ctx, &height, false)
+}
+
+func (o *Oracle) fetchBatch(ctx context.Context, height int64) (*blocks.Header, bool) {
+	rpc, ok := o.rpc.(blockchainInfoRPC)
+	if !ok || height <= 0 {
+		return nil, false
+	}
+	res, err := rpc.BlockchainInfo(ctx, height, height+BlockchainInfoBatch-1)
+	if err != nil {
+		return nil, false
+	}
+	hdrs, err := headersFromBlockchainInfo(res)
+	if err != nil {
+		return nil, false
+	}
+	var want *blocks.Header
+	for _, h := range hdrs {
+		o.history.Put(h)
+		if h.Height == height {
+			want = h
+		}
+	}
+	return want, want != nil
 }
 
 func (o *Oracle) fetchHeader(ctx context.Context, height *int64, observe bool) (*blocks.Header, error) {
@@ -116,6 +148,7 @@ func (o *Oracle) fetchHeader(ctx context.Context, height *int64, observe bool) (
 	} else {
 		o.cache.Remember(hdr)
 	}
+	o.history.Put(hdr)
 	return hdr, nil
 }
 

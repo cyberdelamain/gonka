@@ -15,6 +15,7 @@ import (
 	"common/nodemanager/gen"
 	"devshard/chainoracle/blocks/direct"
 	"devshard/chainoracle/blocks/failover"
+	"devshard/chainoracle/blocks/headertime"
 	"devshard/chainoracle/blocks/tipcache"
 	"devshard/heightsync"
 	"devshard/host"
@@ -90,6 +91,7 @@ func (m *HostManager) SetHeightSyncFromEnv(ctx context.Context, chainClient *cha
 	}
 
 	m.chainOracle = oracle
+	m.headerTimes = headertime.New(oracle)
 	m.heightSync = sched
 	m.heightSyncTip = cache
 	m.cometLiveness = func(ok bool) {
@@ -111,6 +113,7 @@ func (m *HostManager) ObserveChainHeader(h *blocks.Header) {
 	if m == nil {
 		return
 	}
+	m.headerTimes.Observe(h)
 	tip := m.heightSyncTip
 	if tip == nil {
 		logging.Debug("heightsync: comet observe skipped", inferenceTypes.System, "reason", "no cache")

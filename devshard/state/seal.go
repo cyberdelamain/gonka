@@ -15,7 +15,7 @@ import (
 // stateClockWindowFactor sets how many recent live inferences the deterministic
 // state clock scans, as a multiple of the group size N. Concurrency is bounded
 // by the number of slots, so N*factor comfortably covers the in-flight window
-// whose ConfirmedAtHeight anchors approximate "now".
+// whose ConfirmedAtTimeMs anchors approximate "now".
 const stateClockWindowFactor = 3
 
 func autoSealInterval(cfg types.SessionConfig) uint64 {
@@ -435,11 +435,20 @@ func (sm *StateMachine) drainLiveIntoSealedAccLocked(sealNonce uint64) error {
 	}
 	slices.Sort(ids)
 
+	due := make(map[uint64]bool, len(ids))
+	for _, id := range ids {
+		ok, err := sm.liveTimeoutDueAtDrainLocked(sm.state.Inferences[id], sealNonce)
+		if err != nil {
+			return fmt.Errorf("drain live inference %d: %w", id, err)
+		}
+		due[id] = ok
+	}
+
 	cur := sealedAccBytes32(sm.state.SealedAcc)
 
 	for _, id := range ids {
 		rec, _ := sm.inferenceForWriteLocked(id)
-		sm.settleLiveRecordLocked(rec, sealNonce)
+		sm.settleLiveRecordLocked(rec, due[id])
 		if err := sm.updateCommittedEntryLocked(id, rec); err != nil {
 			return fmt.Errorf("drain live inference %d: %w", id, err)
 		}
@@ -481,21 +490,21 @@ func terminalAutoSealStatus(s types.InferenceStatus) bool {
 	}
 }
 
-// StateClockWindow holds the deterministic state-clock value (max ConfirmedAtHeight
+// StateClockWindow holds the deterministic state-clock value (max ConfirmedAtTimeMs
 // over the tail window) plus min/max extents from that scan for diagnostics.
 type StateClockWindow struct {
-	Clock              uint64
-	MinConfirmedHeight uint64
-	MaxConfirmedHeight uint64
-	Known              bool
+	ClockMs          int64
+	MinConfirmedAtMs int64
+	MaxConfirmedAtMs int64
+	Known            bool
 }
 
 // stateClockLocked derives a deterministic "current time" purely from state:
-// the max ConfirmedAtHeight over confirmed live inferences in the latest
+// the max ConfirmedAtTimeMs over confirmed live inferences in the latest
 // N*stateClockWindowFactor tail (N = group size), plus the min and max
-// ConfirmedAtHeight among those confirmed records for diagnostics. Pending and
-// unanchored inferences (ConfirmedAtHeight == 0) are excluded so they do not
-// pull window_min_confirmed_height to zero. Returns Known=false when there are no
+// ConfirmedAtTimeMs among those confirmed records for diagnostics. Pending and
+// unanchored inferences (ConfirmedAtTimeMs == 0) are excluded so they do not
+// pull window_min_confirmed_at_ms to zero. Returns Known=false when there are no
 // live inferences or no confirmed records in the tail window. Caller holds sm.mu.
 func (sm *StateMachine) stateClockLocked() StateClockWindow {
 	if len(sm.state.Inferences) == 0 {
@@ -518,11 +527,11 @@ func (sm *StateMachine) stateClockLocked() StateClockWindow {
 	if len(ids) > window {
 		start = len(ids) - window
 	}
-	var minConfirmed, maxConfirmed uint64
+	var minConfirmed, maxConfirmed int64
 	confirmedInWindow := 0
 	for _, id := range ids[start:] {
-		c := sm.state.Inferences[id].ConfirmedAtHeight
-		if c == 0 {
+		c := sm.state.Inferences[id].ConfirmedAtTimeMs
+		if c <= 0 {
 			continue
 		}
 		if confirmedInWindow == 0 {
@@ -543,10 +552,10 @@ func (sm *StateMachine) stateClockLocked() StateClockWindow {
 		return StateClockWindow{}
 	}
 	return StateClockWindow{
-		Clock:              maxConfirmed,
-		MinConfirmedHeight: minConfirmed,
-		MaxConfirmedHeight: maxConfirmed,
-		Known:              true,
+		ClockMs:          maxConfirmed,
+		MinConfirmedAtMs: minConfirmed,
+		MaxConfirmedAtMs: maxConfirmed,
+		Known:            true,
 	}
 }
 
@@ -563,11 +572,11 @@ func (sm *StateMachine) AutoSealStateClock() StateClockWindow {
 type autoSealCandidate struct {
 	ID               uint64 `json:"id"`
 	Status           uint8  `json:"status"`
-	ConfirmedHeight  uint64 `json:"confirmed_at_height"`
+	ConfirmedAtMs    int64  `json:"confirmed_at_time_ms"`
 	NonceGateOK      bool   `json:"nonce_gate_ok"`
 	ClockGateSkipped bool   `json:"clock_gate_skipped"`
 	ClockGateOK      bool   `json:"clock_gate_ok"`
-	GraceRemaining   uint64 `json:"grace_remaining_blocks,omitempty"`
+	GraceRemainingMs int64  `json:"grace_remaining_ms,omitempty"`
 	Eligible         bool   `json:"eligible"`
 }
 
@@ -577,7 +586,7 @@ func (sm *StateMachine) logAutoSealDiagnosticLocked(
 	clockWin StateClockWindow,
 	sealGraceNonces uint64,
 	graceSeconds int64,
-	stateClock uint64,
+	stateClockMs int64,
 	candidates []autoSealCandidate,
 	sealed []uint64,
 ) {
@@ -594,16 +603,16 @@ func (sm *StateMachine) logAutoSealDiagnosticLocked(
 		"inference_seal_grace_nonces", sealGraceNonces,
 		"inference_seal_grace_seconds", graceSeconds,
 		"execution_timeout", executionTimeout,
-		"finished_clock_required_blocks", sm.timeoutBlocks(FinishedClockRequiredSeconds(graceSeconds, executionTimeout)),
-		"state_clock_confirmed_height", stateClock,
+		"finished_clock_required_ms", secondsToMs(FinishedClockRequiredSeconds(graceSeconds, executionTimeout)),
+		"state_clock_confirmed_at_ms", stateClockMs,
 		"candidates_count", len(candidates),
 		"sealed_count", len(sealed),
 		"live_inferences_count", len(sm.state.Inferences),
 	}
 	if clockWin.Known {
 		args = append(args,
-			"window_min_confirmed_height", clockWin.MinConfirmedHeight,
-			"window_max_confirmed_height", clockWin.MaxConfirmedHeight,
+			"window_min_confirmed_at_ms", clockWin.MinConfirmedAtMs,
+			"window_max_confirmed_at_ms", clockWin.MaxConfirmedAtMs,
 		)
 	}
 	logging.Info("auto-seal evaluation", args...)
@@ -618,10 +627,10 @@ func (sm *StateMachine) logAutoSealDiagnosticLocked(
 //
 // Per live, seal-eligible inference:
 //   - nonce gate (always):  sealNonce >= id + InferenceSealGraceNonces   (id == start nonce)
-//   - clock gate (Finished only): stateClock - ConfirmedAtHeight >=
-//     blocks(InferenceSealGraceSeconds + ExecutionTimeout)
+//   - clock gate (Finished only): stateClock - ConfirmedAtTimeMs >=
+//     InferenceSealGraceSeconds + ExecutionTimeout
 //
-// ConfirmedAtHeight is written at ConfirmStart, so ExecutionTimeout is added to
+// ConfirmedAtTimeMs is written at ConfirmStart, so ExecutionTimeout is added to
 // keep a full grace window after the latest legal Finish. Mixed binaries
 // that disagree on this sum diverge on SealedAcc / post_state_root.
 //
@@ -639,9 +648,9 @@ func (sm *StateMachine) autoSealLocked(side string, sealNonce uint64) ([]uint64,
 	sealGraceNonces := uint64(sm.state.Config.InferenceSealGraceNonces)
 	graceSeconds := int64(sm.state.Config.InferenceSealGraceSeconds)
 	executionTimeout := sm.state.Config.ExecutionTimeout
-	requiredBlocks := sm.timeoutBlocks(FinishedClockRequiredSeconds(graceSeconds, executionTimeout))
+	requiredMs := secondsToMs(FinishedClockRequiredSeconds(graceSeconds, executionTimeout))
 	clockWin := sm.stateClockLocked()
-	stateClock := clockWin.Clock
+	stateClockMs := clockWin.ClockMs
 
 	var candidates []autoSealCandidate
 	var eligible []uint64
@@ -650,9 +659,9 @@ func (sm *StateMachine) autoSealLocked(side string, sealNonce uint64) ([]uint64,
 			continue
 		}
 		candidate := autoSealCandidate{
-			ID:              id,
-			Status:          uint8(rec.Status),
-			ConfirmedHeight: rec.ConfirmedAtHeight,
+			ID:            id,
+			Status:        uint8(rec.Status),
+			ConfirmedAtMs: rec.ConfirmedAtTimeMs,
 		}
 		candidate.NonceGateOK = sealNonce >= id+sealGraceNonces
 		if !candidate.NonceGateOK {
@@ -667,14 +676,14 @@ func (sm *StateMachine) autoSealLocked(side string, sealNonce uint64) ([]uint64,
 			eligible = append(eligible, id)
 			continue
 		}
-		var elapsed uint64
-		if stateClock > rec.ConfirmedAtHeight {
-			elapsed = stateClock - rec.ConfirmedAtHeight
+		var elapsed int64
+		if stateClockMs > rec.ConfirmedAtTimeMs {
+			elapsed = stateClockMs - rec.ConfirmedAtTimeMs
 		}
-		if elapsed < requiredBlocks {
-			candidate.GraceRemaining = requiredBlocks - elapsed
+		if elapsed < requiredMs {
+			candidate.GraceRemainingMs = requiredMs - elapsed
 		}
-		candidate.ClockGateOK = clockWin.Known && candidate.GraceRemaining == 0
+		candidate.ClockGateOK = clockWin.Known && candidate.GraceRemainingMs == 0
 		candidate.Eligible = candidate.ClockGateOK
 		candidates = append(candidates, candidate)
 		if !candidate.ClockGateOK {
@@ -693,7 +702,7 @@ func (sm *StateMachine) autoSealLocked(side string, sealNonce uint64) ([]uint64,
 		}
 	})
 	if len(eligible) == 0 {
-		sm.logAutoSealDiagnosticLocked(side, sealNonce, clockWin, sealGraceNonces, graceSeconds, stateClock, candidates, nil)
+		sm.logAutoSealDiagnosticLocked(side, sealNonce, clockWin, sealGraceNonces, graceSeconds, stateClockMs, candidates, nil)
 		return nil, clockWin, nil
 	}
 	slices.Sort(eligible)
@@ -720,7 +729,7 @@ func (sm *StateMachine) autoSealLocked(side string, sealNonce uint64) ([]uint64,
 		sm.deleteInferenceLocked(id)
 	}
 	sm.state.SealedAcc = append([]byte(nil), cur[:]...)
-	sm.logAutoSealDiagnosticLocked(side, sealNonce, clockWin, sealGraceNonces, graceSeconds, stateClock, candidates, eligible)
+	sm.logAutoSealDiagnosticLocked(side, sealNonce, clockWin, sealGraceNonces, graceSeconds, stateClockMs, candidates, eligible)
 	return eligible, clockWin, nil
 }
 

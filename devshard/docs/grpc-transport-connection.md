@@ -169,7 +169,15 @@ one:
 - Same peer, new nonce → new token; the old one stays valid for **5s** so in-flight
   RPCs still admit.
 - Live TTL refresh posts that Attach on `_` and does **not** re-run
-  `AllowsSender`. A failed refresh keeps Watch and the live token.
+  `AllowsSender`. A failed refresh keeps Watch and the live token, except
+  when the host no longer admits that token (below).
+- `_` is not a roster, so it cannot open a session. An Attach on `_` whose
+  token is expired, forged, or missing is `unauthenticated` (`session
+  expired` or `handshake required`), before ECDSA and without spending the
+  anonymous floor. It carries no `X-Devshard-Error`, so versiond does not
+  charge the origin. The client then clears the token and Attaches on a live
+  door. An older child that answers `escrow is not open` on `_` is read the
+  same way.
 - Re-Attach after Watch loss posts on a live door and **does** re-run
   `AllowsSender`. Dropped from that shard's roster, or a settled id, cannot
   use that URL as a door.
@@ -201,6 +209,7 @@ request's escrow.
         |
         +-- token at ~75% TTL → Attach on /sessions/_/rpc (skip AllowsSender)
         |                       fail: keep Watch + token, retry refresh
+        |                       token gone on host: clear token → door Attach
         +-- Watch dies → clear token → Attach again on a live door
 ```
 
@@ -281,8 +290,15 @@ same derived key. No table, barrier, or membership feed is involved, and
 
 Shutdown or EOF on `Watch` reopens the stream with the same token; expiry and
 other `Unauthenticated` clear it and `Attach` again. Refresh does not wait for
-`Watch` to be up. A renewal on `_` spends a per-peer bucket (burst 4, 4/min)
+`Watch` to be up. A refresh on `_` that the host answers `session expired`
+or `handshake required` also clears the token and Attaches on a door. A renewal on `_` spends a per-peer bucket (burst 4, 4/min)
 before ECDSA instead of the anonymous floor.
+
+A child allows eight concurrent Watches per peer address. That is two replicas,
+two generations during a rolling deploy, and two streams per process while a
+reopen is still unwinding. Replicas of one participant share a signer, so they
+count as one peer, and a second token from that signer shares the cap. A
+reconnect holds the live Watch and the replacement at once.
 
 Token layout, key derivation, and lifetime:
 [Peer RPC sessions under HA](./high-availability-architecture.md#peer-rpc-sessions-under-ha).
@@ -300,7 +316,7 @@ IP on versiond**.
 | Layer | Key | Default | When it fires |
 |---|---|---|---|
 | JSON POSTs after auth (`RateLimitMiddleware`) | recovered sender | 100 rps, burst 200 | Existing session on InferenceUrl. Chat still records `no_receipt_interrupted`. |
-| Attach process floor (`spendAttachToken`) | this child | 10_000/min (`MaxSessions`) | **Before ECDSA**, on an Attach without a live token. |
+| Attach process floor (`spendAttachToken`) | this child | 50 tokens, refilled at 50/s | **Before ECDSA**, on an Attach without a live token. `DEVSHARD_RPC_ATTACH_PER_MIN_TOTAL` at 50 or above selects this bucket. A value `n` below 50 is `n` tokens refilled at `n`/s. `MaxSessions` (10_000) caps Watches, not this bucket. |
 | Attach renewal (`takeRenewal`) | peer in a live token | burst 4, 4/min | **Before ECDSA**, on an Attach that presents a live token. Off when limits are disabled. |
 | RPC peer weight | session address after Attach | **6000/min**, burst 10% (600) | Authenticated RPCs. Watch is a stream cap, not this bucket. |
 | Unknown-escrow first bind (child) | recovered gonka address | **2 unique ids/min**, process floor **300/min** | Cold `GetEscrow` on Attach / owner chat / height-sync seed |
@@ -313,14 +329,18 @@ not the unknown-id budget and they do not key on gonka address.
 ### RPC channel weights
 
 One token bucket after handshake. Watch/Chat stay a **concurrent slot cap** (`max_streams`,
-default 10241, with Chat stopped at 10240). Weights are protocol constants (not env). Effective max if that
+default 2561, with Chat stopped at 2560; process-wide Chat stops at 10240). Only the escrow owner takes a Chat slot, after its envelope is read. Weights are protocol constants (not env). Effective max if that
 event is the only traffic is `floor(budget / weight)`.
 
 | Bucket | Key | Default | Env |
 |---|---|---|---|
 | **Peer** | session address after Attach | 6000/min, burst 10% (600) | `DEVSHARD_RPC_MSGS_PER_MIN`, `DEVSHARD_RPC_MSGS_BURST` |
 
-Process-wide Attach before ECDSA stays 10_000 (`DEVSHARD_RPC_ATTACH_PER_MIN_TOTAL`).
+Process-wide Attach before ECDSA is 50 tokens refilled at 50 per second
+(`DEVSHARD_RPC_ATTACH_PER_MIN_TOTAL` unset, or any value of 50 or more).
+The name is the configured ceiling, not the refill rate: a value below 50
+is both the burst and the per-second refill, and a larger value does not
+grow the bucket. `MaxSessions` (10_000) is the Watch cap.
 Per-IP Attach is not a child limiter: `RemoteAddr` is versiond, and an empty
 `X-Real-IP` is not a key. TCP / path rate belongs on versiond / Phase 6 `proxy`
 (`src`). `DEVSHARD_RPC_LIMITS=off` disables the interceptor buckets and the Attach floor.
@@ -391,6 +411,15 @@ minute), chat is never retried on the same host, and the participant limiter
 records a failure strike instead of the `http_quarantine_ms` quarantine. The
 header is host-set, so a host that keeps answering it reaches that quarantine
 at the strike threshold (3).
+
+Validation `GetPayload` is different. A `429`, including
+`escrow_lookup_limited`, is `ErrPayloadRateLimited` and is not a verdict.
+The validator keeps its lease and fetches once more after 30s, or after
+`Retry-After` when that is longer. `escrow_lookup_limited` sends no
+`Retry-After` and its budget is a sliding minute, so that retry waits 1 min.
+The wait is capped at 1 min. A `429` on the retry votes `Valid:false` with
+reason `rate_limited`. The short payload retry (two attempts, 500ms) does
+not run for a `429`. A `/rpc/release` during the wait publishes nothing.
 
 The child **must not** key this on origin IP. Mixed fleets and hop-stamped
 `X-Real-IP` would collapse every client onto one 2/min slot.
@@ -503,7 +532,7 @@ client → nginx (InferenceUrl) → …   # unchanged
 | Hop | Change |
 |---|---|
 | nginx / proxy-policy | **Not on `/rpc/`.** Keep InferenceUrl for JSON and the public API. No `grpc_pass`. local-test-net's nginx container is also named `proxy` (`proxy/` image) — that is this row, not the h2 bind. |
-| **proxy (proxy-router)** | Public `{DEVSHARD_RPC_H2_PORT}` bind. Skip `proxy-policy`. `proto h2` to versiond-router (HA) or `versiond:8080` (non-HA). Stick-table `conn_rate` / `sess_rate` and path zones on `src`. **Overwrite `X-Real-IP` from `src`** (do not forward the caller’s header). HTTPS: mount `SSL_CERT_SOURCE` (`./secrets/nginx-ssl`) and `bind ssl crt … proto h2`. Keep the same version + escrow hash as `versiond_router_in`. `:80/:443` stay TCP-to-nginx. |
+| **proxy (proxy-router)** | Public `{DEVSHARD_RPC_H2_PORT}` bind. Skip `proxy-policy`. `proto h2` to versiond-router (HA) or `versiond:8080` (non-HA). Stick-table `conn_cur` / `conn_rate` / `sess_rate` and path zones on `src,ipmask(32,64)` (one IPv4 address, or one IPv6 /64; table type `ipv6`). Direct clients are keyed at accept. A trusted PROXY balancer is keyed at session time, after the preamble. **Overwrite `X-Real-IP` from the full `src`** (do not forward the caller’s header). HTTPS: mount `SSL_CERT_SOURCE` (`./secrets/nginx-ssl`) and `bind ssl crt … proto h2`. Keep the same version + escrow hash as `versiond_router_in`. `:80/:443` stay TCP-to-nginx. |
 | versiond-router (HA) | Inner hop. `proto h2` on the frontend from `proxy` **and** on every backend to versiond (h2c). Keep version + escrow hash on `:path`. Do not re-key per-IP zones (`RemoteAddr` is `proxy`). |
 | versiond (both) | `h2c.NewHandler` on the listen that serves `/rpc/`; reverse-proxy with an **HTTP/2** transport to the child (not the default HTTP/1.1 `ReverseProxy`); still accept HTTP/1.1 from nginx for JSON |
 | `devshardd` | Wrap the existing loopback `http.Server` with `h2c.NewHandler`. Same Connect mux, no extra bind |
@@ -540,10 +569,18 @@ want one wire protocol.
 
 The nginx per-IP ceiling disappears for this path. Replace it on the published listen:
 
-- **TCP / HTTP/2 connection rate per IP** (phase 6, stick-table on `src` at **`proxy`**)
-  — nginx `limit_conn` analogue. Handshake and Attach do not bound socket opens.
+- **Concurrent connections per address** (stick-table `conn_cur` on
+  `src,ipmask(32,64)` at **`proxy`**, default 32,
+  `PROXY_ROUTER_RPC_MAX_CONNS_PER_SRC`) — the nginx `limit_conn` analogue.
+  One IPv4 address, or one IPv6 /64. Direct clients are keyed at accept. A
+  trusted PROXY balancer is keyed after the preamble, when `src` is the client.
+  An idle socket that is already tracked holds a `maxconn` slot until
+  `timeout client`. A preamble that stalls before the TLS handshake is closed
+  by `timeout client-hs` (5s) and is not in the cap yet.
+- **TCP / HTTP/2 connection rate per address** (phase 6, stick-table `conn_rate` /
+  `sess_rate` on the same key at **`proxy`**). Handshake and Attach do not bound socket opens.
 - **Path zones** (phase 6) on **`proxy`**: Attach / Chat / diffs / gossip as separate
-  `src` budgets. The Connect method is in the URL; no protobuf parse. versiond-router
+  `src,ipmask(32,64)` budgets. The Connect method is in the URL; no protobuf parse. versiond-router
   and inner versiond on HA must not re-key on `RemoteAddr` (`proxy`). The child must not
   apply Echo IP zones on `/rpc/` (loopback).
 - **Process-wide Attach floor before ECDSA** (phase 4) in the child. Per-IP

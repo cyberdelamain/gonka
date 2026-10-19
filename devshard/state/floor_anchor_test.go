@@ -132,8 +132,7 @@ func TestConfirmCarriesTheAssignmentFloorAndAnchorsAtTheLandingFloor(t *testing.
 
 func TestTimeoutIsDueOnlyOnceTheFloorClearsTheAnchor(t *testing.T) {
 	d := newFloorDriver(t)
-	d.sm.heartbeatCfg.BlockTime = 0
-	refusalBlocks := d.sm.timeoutBlocks(d.sm.Config().RefusalTimeout)
+	refusalBlocks := uint64(d.sm.Config().RefusalTimeout)
 	require.Positive(t, refusalBlocks)
 
 	hash := []byte{0x01, 0x00}
@@ -144,7 +143,7 @@ func TestTimeoutIsDueOnlyOnceTheFloorClearsTheAnchor(t *testing.T) {
 	d.raise(100+refusalBlocks-1, []byte{0x01, 0x01})
 	remaining, err := d.sm.TimeoutRemaining(id, types.TimeoutReason_TIMEOUT_REASON_REFUSED)
 	require.NoError(t, err)
-	require.Equal(t, uint64(1), remaining)
+	require.Equal(t, time.Second, remaining)
 	before, err := d.sm.ComputeStateRoot()
 	require.NoError(t, err)
 	require.ErrorIs(t, d.apply(d.timeout(id, types.TimeoutReason_TIMEOUT_REASON_REFUSED)), types.ErrTimeoutNotDue)
@@ -162,7 +161,7 @@ func TestTimeoutIsDueOnlyOnceTheFloorClearsTheAnchor(t *testing.T) {
 
 func TestExecutionTimeoutCountsFromTheConfirmAnchor(t *testing.T) {
 	d := newFloorDriver(t)
-	execBlocks := d.sm.timeoutBlocks(d.sm.Config().ExecutionTimeout)
+	execBlocks := uint64(d.sm.Config().ExecutionTimeout)
 	hash := []byte{0x01, 0x00}
 	d.raise(100, hash)
 	id := d.next()
@@ -187,7 +186,9 @@ func TestSettlementDoesNotPayAnUnanchoredReservation(t *testing.T) {
 	sealNonce := d.next()
 	d.sm.mu.Lock()
 	live, _ := d.sm.inferenceForWriteLocked(1)
-	d.sm.settleLiveRecordLocked(live, sealNonce)
+	due, err := d.sm.liveTimeoutDueAtDrainLocked(live, sealNonce)
+	require.NoError(t, err)
+	d.sm.settleLiveRecordLocked(live, due)
 	d.sm.mu.Unlock()
 
 	require.Equal(t, types.StatusTimedOut, live.Status)
@@ -205,7 +206,7 @@ func TestSettlementRefundsAnAnchoredReservationTheFloorNeverReached(t *testing.T
 		id := d.next()
 		require.NoError(t, d.start(id, 100, hash))
 		if due {
-			d.raise(100+d.sm.timeoutBlocks(d.sm.Config().RefusalTimeout), []byte{0x02, 0x00})
+			d.raise(100+uint64(d.sm.Config().RefusalTimeout), []byte{0x02, 0x00})
 		}
 		rec, ok := d.sm.GetInference(id)
 		require.True(t, ok)
@@ -214,7 +215,9 @@ func TestSettlementRefundsAnAnchoredReservationTheFloorNeverReached(t *testing.T
 		sealNonce := d.next()
 		d.sm.mu.Lock()
 		live, _ := d.sm.inferenceForWriteLocked(id)
-		d.sm.settleLiveRecordLocked(live, sealNonce)
+		timeoutDue, err := d.sm.liveTimeoutDueAtDrainLocked(live, sealNonce)
+		require.NoError(t, err)
+		d.sm.settleLiveRecordLocked(live, timeoutDue)
 		d.sm.mu.Unlock()
 
 		stats, _ := d.sm.HostStatsFor(rec.ExecutorSlot)
@@ -253,14 +256,16 @@ func makeTimeoutDue(t *testing.T, sm *StateMachine, ids ...uint64) {
 		}
 		if rec.StartedAtHeight == 0 {
 			rec.StartedAtHeight = 1
+			rec.StartedAtTimeMs = testutil.HeightClockBlockMs
 		}
 		if rec.Status == types.StatusStarted && rec.ConfirmedAtHeight == 0 {
 			rec.ConfirmedAtHeight = 1
+			rec.ConfirmedAtTimeMs = testutil.HeightClockBlockMs
 		}
 		require.NoError(t, sm.updateCommittedEntryLocked(id, rec))
 		top = max(top, rec.StartedAtHeight, rec.ConfirmedAtHeight)
 	}
-	due := top + sm.timeoutBlocks(max(sm.state.Config.RefusalTimeout, sm.state.Config.ExecutionTimeout))
+	due := top + uint64(max(sm.state.Config.RefusalTimeout, sm.state.Config.ExecutionTimeout))
 	if cur, _ := sm.heightSyncFloor.Max(); cur > due {
 		due = cur
 	}
@@ -322,15 +327,4 @@ func TestReceiptOutlivesThePrunedFloorHistory(t *testing.T) {
 	require.NoError(t, d.apply(receipt))
 	rec, _ = d.sm.GetInference(id)
 	require.Equal(t, types.StatusStarted, rec.Status)
-}
-
-func TestTimeoutBlocksUseTheEscrowBlockTime(t *testing.T) {
-	d := newFloorDriver(t)
-	require.Equal(t, uint64(60), d.sm.timeoutBlocks(60), "unset falls back to the compiled 1s")
-
-	d.sm.state.Config.TimeoutBlockTimeMs = 5000
-	require.Equal(t, uint64(12), d.sm.timeoutBlocks(60))
-	require.Equal(t, uint64(384), d.sm.timeoutBlocks(1920))
-	require.Equal(t, uint64(1), d.sm.timeoutBlocks(1), "a partial block rounds up")
-	require.Equal(t, 10*time.Second, d.sm.BlocksToDuration(2))
 }

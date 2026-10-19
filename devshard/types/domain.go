@@ -61,6 +61,8 @@ type InferenceRecord struct {
 	StartedAtHeight    uint64          `json:"started_at_height,omitempty"`
 	StartedAtBlockHash []byte          `json:"started_at_block_hash,omitempty"`
 	ConfirmedAtHeight  uint64          `json:"confirmed_at_height,omitempty"`
+	StartedAtTimeMs    int64           `json:"started_at_time_ms,omitempty"`
+	ConfirmedAtTimeMs  int64           `json:"confirmed_at_time_ms,omitempty"`
 	VotesValid         uint32          `json:"votes_valid,omitempty"`
 	VotesInvalid       uint32          `json:"votes_invalid,omitempty"`
 	ValidatedBy        Bitmap128       `json:"validated_by,omitempty"`
@@ -151,7 +153,6 @@ type SessionConfig struct {
 	// before a still-Finished inference may auto-seal.
 	InferenceSealGraceSeconds uint32
 	AutoSealEveryNNonces      uint32
-	TimeoutBlockTimeMs        uint32
 }
 
 // EscrowState is the full state of a devshard session.

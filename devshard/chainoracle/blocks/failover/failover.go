@@ -397,6 +397,29 @@ func (o *Oracle) At(ctx context.Context, height int64) (*blocks.Header, error) {
 	return cloneHeader(h), nil
 }
 
+func (o *Oracle) HeaderAt(ctx context.Context, height int64) (*blocks.Header, error) {
+	if o == nil || height <= 0 {
+		return blocks.DummyHeader(height), nil
+	}
+	if h := o.fromWindow(ctx, height); h != nil {
+		return h, nil
+	}
+	if tip := o.knownTipHeight(ctx); tip > 0 && height > tip {
+		return blocks.DummyHeader(height), nil
+	}
+	v, err, _ := o.atFlight.Do("history:"+strconv.FormatInt(height, 10), func() (any, error) {
+		return o.atFetch(ctx, height, o.now())
+	})
+	if err != nil {
+		return nil, err
+	}
+	h, _ := v.(*blocks.Header)
+	if !usable(h) {
+		return blocks.DummyHeader(height), nil
+	}
+	return cloneHeader(h), nil
+}
+
 func (o *Oracle) atFetch(ctx context.Context, height int64, now time.Time) (*blocks.Header, error) {
 	if blocked, skipErr := o.nmBlocked(now); blocked {
 		logAtTry("get_block_header", height, nil, skipErr)

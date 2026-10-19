@@ -1,8 +1,8 @@
 package bridge
 
 import (
-	"devshard/types"
 	"fmt"
+	"devshard/types"
 )
 
 // BuildGroupFromEscrow constructs slot assignments from an already-fetched escrow.

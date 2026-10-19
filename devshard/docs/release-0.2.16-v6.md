@@ -73,8 +73,8 @@ listen. The nginx image does not publish it.
 | --- | --- |
 | **Peer RPC and authentication** | Connect on `/devshard/{version}/sessions/{id}/rpc/...`. `Attach` opens a session; `Watch` keeps it. Admission after that is the session token. The signed envelope still covers dispute-bearing bodies |
 | **gzip** | Chat responses are one gzip stream for the whole completion (compression window kept across events, not one gzip per frame). Request gzip is inflated only up to a decoded cap, and a body past that cap is rejected before the handler. `GET /devshard/stats/rpc` is gzip when the caller sends `Accept-Encoding: gzip` |
-| **Per-peer rate limits** | After `Attach`, the child charges the authenticated peer: 6000 weight/min, burst 600. Concurrent chats per peer default to 10240. `GetDiffs` is expensive (weight 60) so it cannot spend the chat budget. Anonymous `Attach` is capped before the signature check |
-| **Per-connection rate limits** | v6 `proxy-router` only. One HTTP/2 connection per peer. That connection is limited per client address: 200 new connections/s, 400 new sessions/s, plus a separate request budget per RPC path |
+| **Per-peer rate limits** | After `Attach`, the child charges the authenticated peer: 6000 weight/min, burst 600. Concurrent chats per peer default to 2560, a quarter of the 10240 process cap. Only the escrow owner takes a chat slot. `GetDiffs` is expensive (weight 60) so it cannot spend the chat budget. Anonymous `Attach` is capped before the signature check |
+| **Per-connection rate limits** | v6 `proxy-router` only. One HTTP/2 connection per peer. That connection is limited per client address: 32 concurrent connections, 200 new connections/s, 400 new sessions/s, plus a separate request budget per RPC path |
 | **Gateway Postgres** | `DEVSHARD_STORAGE_MODE=hybrid` or `postgres` keeps gateway management state in Postgres. `sqlite` stays on local `gateway.db` and ignores `PGHOST`. The same mode applies to `perf.db` |
 | **Load testing** | YAML scenarios drive the gateway through an isolated Docker testenv: concurrent traffic, mock ML-node faults, host pause, catch-up, escrow rotation, and miss-rate checks. In-process `loadsim` remains for gateway and `perf.db` profiles |
 | **Refusal vote** | Already on `devshard/v4.2` and included here. A receipt that arrives during the refusal wait ends that wait. The gateway does not ask verifiers for a refusal once the inference is confirmed. An unsigned or forged receipt cannot cancel the vote |
@@ -185,10 +185,19 @@ loopback). Defaults:
 | --- | --- | --- |
 | Weight per minute | 6000 | `DEVSHARD_RPC_MSGS_PER_MIN` |
 | Burst | 600 (10% of the minute) | `DEVSHARD_RPC_MSGS_BURST` |
-| Concurrent chats per peer | 10240 | `DEVSHARD_RPC_MAX_STREAMS_PER_PEER` (streams = chats + 1, so Watch still fits) |
-| Watch streams per peer | 2 | fixed |
+| Concurrent chats per peer | 2560 | `DEVSHARD_RPC_MAX_STREAMS_PER_PEER` (streams = chats + 1, so Watch still fits) |
+| Concurrent chats per process | 10240 | `DEVSHARD_RPC_MAX_STREAMS_TOTAL` (streams = chats + 1) |
+| Chats whose envelope is not read yet | 512 per peer, 2048 per process | fixed. Off when the matching stream cap is unlimited |
+| Envelope read deadline | 15s | `PeerAuthConfig.ChatReadTimeout` |
+| Deadline per chat frame write | 30s | `PeerAuthConfig.ChatSendTimeout` |
+| Watch streams per peer | 8 | fixed |
 | `Attach` renewal, before the signature check | burst 4, 4/min | fixed |
 | Anonymous `Attach` floor | 50 tokens, refilled at 50/s | `DEVSHARD_RPC_ATTACH_PER_MIN_TOTAL` |
+
+Watch streams per peer is 8: two replicas, two generations during a rolling
+deploy, and two streams per process while a reopen is still unwinding.
+Replicas of one participant share a signer and count as one peer. A second
+token from that signer shares the same cap.
 
 `DEVSHARD_RPC_LIMITS=off` disables the child buckets. Leave it unset in
 production.
@@ -210,6 +219,16 @@ then the sustained rate. Peer A exhausting the bucket does not charge peer B.
 `Chat` weighs 1 because every chat already spends a nonce the escrow pays for;
 the budget is there for the RPCs that cost the caller nothing.
 
+A chat slot and its charge are taken only after the child has read the
+envelope and resolved the caller as the escrow owner, and before the envelope
+signature check. A non-owner, or a caller that never finishes sending the
+envelope, holds no chat slot and spends no budget. Until its envelope is read,
+a chat counts only against the pending caps above. The child drops it at the
+15s read deadline. Once streaming, a chat whose gateway stops reading is dropped
+when one frame write passes 30s, and its slot is freed.
+`devshard_peer_rpc_chat_dropped_total{reason}` counts these drops
+(`pending_cap`, `read_timeout`, `send_timeout`).
+
 ### Per-connection limits (v6 `proxy-router` only)
 
 These do not exist on HTTP/1.1. They key the client address on `:9443`.
@@ -218,6 +237,7 @@ A second peer (a second address) has its own connection and its own counters.
 
 | Check | Threshold | Over-limit response |
 | --- | --- | --- |
+| Concurrent connections per address | 32 (`PROXY_ROUTER_RPC_MAX_CONNS_PER_SRC`) | connection rejected, before `Attach` |
 | New TCP connections | 200/s | connection rejected, before `Attach` |
 | New HTTP/2 sessions | 400/s | session rejected |
 | `Attach`, `Watch` | 100 / 10s | Connect: HTTP 429. Native gRPC: HTTP 200, `grpc-status` 8 |
@@ -235,6 +255,17 @@ The listen overwrites `X-Real-IP` from the real client address. A caller-supplie
 `X-Real-IP` is discarded. Inner hops must not rate-limit on `RemoteAddr`; on
 HA that address is `proxy-router`, and collapsing every peer into one bucket
 is a failed rollout.
+
+The concurrent cap is what bounds idle sockets: the open rate only slows how
+fast one address fills `maxconn 4096`, and an idle socket that is already
+tracked holds its slot until `timeout client`. 32 leaves room for reconnect
+overlap, HA replicas, and several peers behind one NAT address. The key is one
+IPv4 address, or one IPv6 /64. Direct clients are keyed at accept. With
+`PROXY_ROUTER_PROXY_PROTOCOL_FROM`, the balancer address is skipped and the
+cap uses the address in the PROXY preamble, after that preamble is accepted.
+A preamble that stalls before the TLS handshake is closed by `timeout
+client-hs` (5s) and is not counted yet. Without PROXY protocol, clients
+behind one L4 balancer share that balancer's address and its 32 slots.
 
 ## Manual test plan
 
@@ -327,7 +358,7 @@ suddenly requires `:9443` is a failure.
 Run A and B on both wrappings. Run C–G only after section 2, on a v6
 `proxy-router` cell (SR and HR). Two source addresses, two keys.
 
-The production chat cap (10240) and the 6000/min budget are the wrong size
+The production chat cap (2560 per peer) and the 6000/min budget are the wrong size
 to hit by hand. For A and B, on a non-production child only:
 
 ```bash
@@ -362,6 +393,12 @@ flood. Confirm the connection count stays 1 for the whole run.
 (no signature work in the child logs for the refused ones). A second address,
 opening a single connection in the same second, attaches and chats. Repeat
 against InferenceUrl on the old wrapping: this reject must not appear.
+
+**D2. Concurrent connections (v6 only).** From one address, open 33 TCP
+connections to `:9443` at under 200/s and send nothing on them. The first 32
+stay open; the 33rd is closed at accept. A second address opens a connection
+in the same window, attaches, and chats. Close one of the 32 and the next open
+from the first address is accepted again.
 
 **E. Forged `X-Real-IP` (v6 only).** Peer A sets `X-Real-IP` to peer B's
 address. A's flood still counts against A's real address. B is not pushed

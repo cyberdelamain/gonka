@@ -170,6 +170,8 @@ type InferenceRecordProto struct {
 	ConfirmedAtHeight  uint64                 `protobuf:"varint,19,opt,name=confirmed_at_height,json=confirmedAtHeight,proto3" json:"confirmed_at_height,omitempty"`
 	ServedHash         []byte                 `protobuf:"bytes,20,opt,name=served_hash,json=servedHash,proto3" json:"served_hash,omitempty"`
 	StartedAtBlockHash []byte                 `protobuf:"bytes,21,opt,name=started_at_block_hash,json=startedAtBlockHash,proto3" json:"started_at_block_hash,omitempty"`
+	StartedAtTimeMs    int64                  `protobuf:"varint,22,opt,name=started_at_time_ms,json=startedAtTimeMs,proto3" json:"started_at_time_ms,omitempty"`
+	ConfirmedAtTimeMs  int64                  `protobuf:"varint,23,opt,name=confirmed_at_time_ms,json=confirmedAtTimeMs,proto3" json:"confirmed_at_time_ms,omitempty"`
 	unknownFields      protoimpl.UnknownFields
 	sizeCache          protoimpl.SizeCache
 }
@@ -337,6 +339,20 @@ func (x *InferenceRecordProto) GetStartedAtBlockHash() []byte {
 	return nil
 }
 
+func (x *InferenceRecordProto) GetStartedAtTimeMs() int64 {
+	if x != nil {
+		return x.StartedAtTimeMs
+	}
+	return 0
+}
+
+func (x *InferenceRecordProto) GetConfirmedAtTimeMs() int64 {
+	if x != nil {
+		return x.ConfirmedAtTimeMs
+	}
+	return 0
+}
+
 type InferencesMapProto struct {
 	state         protoimpl.MessageState  `protogen:"open.v1"`
 	Entries       []*InferenceRecordProto `protobuf:"bytes,1,rep,name=entries,proto3" json:"entries,omitempty"`
@@ -394,7 +410,7 @@ const file_devshard_v1_state_proto_rawDesc = "" +
 	"\x14required_validations\x18\x05 \x01(\rR\x13requiredValidations\x123\n" +
 	"\x15completed_validations\x18\x06 \x01(\rR\x14completedValidations\"J\n" +
 	"\x11HostStatsMapProto\x125\n" +
-	"\aentries\x18\x01 \x03(\v2\x1b.devshard.v1.HostStatsProtoR\aentries\"\xe1\x05\n" +
+	"\aentries\x18\x01 \x03(\v2\x1b.devshard.v1.HostStatsProtoR\aentries\"\xbf\x06\n" +
 	"\x14InferenceRecordProto\x12!\n" +
 	"\finference_id\x18\x01 \x01(\x04R\vinferenceId\x12\x16\n" +
 	"\x06status\x18\x02 \x01(\rR\x06status\x12#\n" +
@@ -420,7 +436,9 @@ const file_devshard_v1_state_proto_rawDesc = "" +
 	"\x13confirmed_at_height\x18\x13 \x01(\x04R\x11confirmedAtHeight\x12\x1f\n" +
 	"\vserved_hash\x18\x14 \x01(\fR\n" +
 	"servedHash\x121\n" +
-	"\x15started_at_block_hash\x18\x15 \x01(\fR\x12startedAtBlockHashJ\x04\b\r\x10\x0eJ\x04\b\x0e\x10\x0fR\n" +
+	"\x15started_at_block_hash\x18\x15 \x01(\fR\x12startedAtBlockHash\x12+\n" +
+	"\x12started_at_time_ms\x18\x16 \x01(\x03R\x0fstartedAtTimeMs\x12/\n" +
+	"\x14confirmed_at_time_ms\x18\x17 \x01(\x03R\x11confirmedAtTimeMsJ\x04\b\r\x10\x0eJ\x04\b\x0e\x10\x0fR\n" +
 	"started_atR\fconfirmed_at\"Q\n" +
 	"\x12InferencesMapProto\x12;\n" +
 	"\aentries\x18\x01 \x03(\v2!.devshard.v1.InferenceRecordProtoR\aentriesB\x10Z\x0edevshard/typesb\x06proto3"

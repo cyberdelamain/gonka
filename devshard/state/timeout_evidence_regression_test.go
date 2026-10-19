@@ -21,6 +21,9 @@ type auditPeer struct {
 }
 
 func (p auditPeer) GetMempool(context.Context) ([]*types.DevshardTx, error) { return p.txs, nil }
+func (p auditPeer) ChallengeCatchUp(context.Context, uint64, []types.DiffWire, string) error {
+	return nil
+}
 func (p auditPeer) ChallengeReceipt(context.Context, uint64, *host.InferencePayload, []types.Diff) ([]byte, []*types.DevshardTx, error) {
 	return p.receipt, p.txs, nil
 }
@@ -113,9 +116,9 @@ func TestTimeoutEvidenceRejectsHeightRegression(t *testing.T) {
 				var accept bool
 				var err error
 				if execution {
-					accept, err = host.VerifyExecutionTimeout(context.Background(), st, id, local, peer, pool, sm)
+					accept, err = host.VerifyExecutionTimeout(context.Background(), st, id, st.Inferences[id], local, peer, pool, sm)
 				} else {
-					accept, err = host.VerifyRefusedTimeout(context.Background(), st, id, payload, local, peer, pool, sm)
+					accept, err = host.VerifyRefusedTimeout(context.Background(), st, id, st.Inferences[id], payload, local, peer, pool, sm)
 				}
 				require.NoError(t, err)
 				require.True(t, accept, "non-applicable evidence must not veto a timeout")
@@ -126,7 +129,7 @@ func TestTimeoutEvidenceRejectsHeightRegression(t *testing.T) {
 			if err == nil {
 				require.Empty(t, applied)
 			}
-			require.Empty(t, host.VerifiedRecoveryTxsFor(sm, st, id, pool.Txs()))
+			require.Empty(t, host.VerifiedRecoveryTxsFor(sm, st, id, st.Inferences[id], pool.Txs()))
 
 			reason := types.TimeoutReason_TIMEOUT_REASON_REFUSED
 			if execution {

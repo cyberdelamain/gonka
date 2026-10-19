@@ -114,6 +114,9 @@ func (v *Validator) Validate(ctx context.Context, req devshardpkg.ValidateReques
 		if verdict := executorFaultVerdict(ctx, v.phase, req, epochID, err, v.voteFalseOnFetchFailure); verdict != nil {
 			return verdict, nil
 		}
+		if errors.Is(err, ErrPayloadRateLimited) {
+			return nil, observability.Classify(observability.ReasonRateLimited, observability.WhereRuntimeValidate, fmt.Errorf("fetch payloads from executor: %w", err))
+		}
 		if errors.Is(err, commonvalidation.ErrPayloadGone) {
 			logging.Info("devshard validation skipped: payload pruned on executor",
 				types.Validation,
@@ -141,7 +144,7 @@ func (v *Validator) Validate(ctx context.Context, req devshardpkg.ValidateReques
 		return nil, observability.Classify(observability.ReasonOriginalParseErr, observability.WhereRuntimeValidate, fmt.Errorf("parse original response: %w", err))
 	}
 
-	result, err := commonvalidation.ExecuteValidation(
+	result, err := commonvalidation.ExecuteValidationWithPolicy(
 		ctx,
 		inferenceID,
 		promptPayload,
@@ -152,6 +155,7 @@ func (v *Validator) Validate(ctx context.Context, req devshardpkg.ValidateReques
 		req.InputTokens, req.OutputTokens,
 		v.chainParams.LogprobsMode(),
 		v.vocabularySizes.Resolve(ctx, epochID, req.Model),
+		commonvalidation.DefaultShortOutputScoringPolicy.ForModel(req.Model),
 	)
 	if err != nil {
 		return nil, classifyExecuteValidationErr(err)
@@ -276,7 +280,9 @@ func executorFaultVerdict(ctx context.Context, phase *chain.Phase, req devshardp
 	case errors.Is(err, commonvalidation.ErrPayloadTooLarge):
 		reason = observability.ReasonPayloadTooLarge
 	case errors.Is(err, errExecutorPayloadFault):
-		// executor-attributable
+		if errors.Is(err, ErrPayloadRateLimited) {
+			reason = observability.ReasonRateLimited
+		}
 	default:
 		return nil
 	}

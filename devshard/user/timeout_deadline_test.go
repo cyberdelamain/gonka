@@ -65,8 +65,8 @@ func TestTimeoutDeadlineReadsTheConfirmAnchorFromTheRecordAfterARestart(t *testi
 	remaining, err := session.sm.TimeoutRemaining(nonce, types.TimeoutReason_TIMEOUT_REASON_EXECUTION)
 	require.NoError(t, err)
 	require.Positive(t, remaining)
-	window := session.sm.BlocksToDuration(remaining) + TimeoutBuffer
-	require.WithinDuration(t, before.Add(window), deadline, time.Second, "the deadline is the blocks the floor still has to rise past the record's anchor")
+	window := remaining + TimeoutBuffer
+	require.WithinDuration(t, before.Add(window), deadline, time.Second, "the deadline is the block time the floor still has to cover past the record's anchor")
 }
 
 // Test flow:
