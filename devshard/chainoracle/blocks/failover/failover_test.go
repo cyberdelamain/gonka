@@ -3,6 +3,7 @@ package failover_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -644,4 +645,39 @@ func TestHeaderAtWaitFallsBackToTheChainWhenTheNodeManagerIsDown(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, int64(7), h.Height)
 	require.Equal(t, int64(1), chain.calls.Load())
+}
+
+func TestHeaderAtWaitDoesNotFallBackAfterAVerificationRejection(t *testing.T) {
+	nm := &recOracle{err: fmt.Errorf("%w: forged", blocks.ErrHeaderUnverified)}
+	chain := &recOracle{hdr: nmHdr()}
+	o := failover.New(nil, nm, chain)
+
+	_, err := o.HeaderAtWait(context.Background(), 7, time.Second)
+	require.ErrorIs(t, err, blocks.ErrHeaderUnverified)
+	require.Zero(t, chain.calls.Load(), "dapi answered that the header is not proven")
+}
+
+func TestHeaderAtWaitDoesNotFallBackOnAnInternalAnswer(t *testing.T) {
+	nm := &recOracle{err: status.Error(codes.Internal, "observer: commit rpc: i/o timeout")}
+	chain := &recOracle{hdr: nmHdr()}
+	o := failover.New(nil, nm, chain)
+
+	_, err := o.HeaderAtWait(context.Background(), 7, time.Second)
+	require.Error(t, err)
+	require.Equal(t, codes.Internal, status.Code(err))
+	require.Zero(t, chain.calls.Load(), "a gRPC status is judged by its code, not by the words in its message")
+}
+
+func TestHeaderAtWaitIgnoresTransportWordsInARejection(t *testing.T) {
+	nm := &recOracle{err: fmt.Errorf("%w: chain id \"i/o timeout\" connection refused", blocks.ErrHeaderUnverified)}
+	chain := &recOracle{hdr: nmHdr()}
+	o := failover.New(nil, nm, chain)
+	_, err := o.HeaderAtWait(context.Background(), 7, time.Second)
+	require.ErrorIs(t, err, blocks.ErrHeaderUnverified)
+
+	nm = &recOracle{err: errors.New("i/o timeout")}
+	o = failover.New(nil, nm, chain)
+	_, err = o.HeaderAtWait(context.Background(), 7, time.Second)
+	require.Error(t, err, "a plain error is not a gRPC transport status")
+	require.Zero(t, chain.calls.Load())
 }

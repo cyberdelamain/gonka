@@ -125,6 +125,7 @@ type StateMachine struct {
 
 	warmResolver WarmKeyResolver // optional, nil = no warm key support
 	headerTimes  HeaderTimeSource
+	deferred     []*types.DevshardTx
 
 	heartbeatCfg    heightsync.HeartbeatConfig
 	turnTracker     *heightsync.TurnTracker
@@ -179,6 +180,7 @@ type ValidatedDiff struct {
 	Root      []byte
 	WarmAfter map[uint32]string
 	Applied   []*types.DevshardTx // populated for the best-effort (gateway) path
+	Deferred  []*types.DevshardTx
 	nonce     uint64
 	journal   *mutationJournal
 	obs       []deferredObsWrite
@@ -451,9 +453,29 @@ func (sm *StateMachine) ApplyLocalPersisted(nonce uint64, txs []*types.DevshardT
 // Returns the post-state root and the subset of txs that were applied.
 // Used by the user to compose diffs from pending txs that may be stale.
 func (sm *StateMachine) ApplyLocalBestEffort(nonce uint64, txs []*types.DevshardTx) ([]byte, []*types.DevshardTx, error) {
+	root, applied, _, err := sm.ApplyLocalBestEffortDeferred(nonce, txs)
+	return root, applied, err
+}
+
+func (sm *StateMachine) ApplyLocalBestEffortDeferred(nonce uint64, txs []*types.DevshardTx) ([]byte, []*types.DevshardTx, []*types.DevshardTx, error) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
-	return sm.localBestEffortLocked(nonce, txs)
+	root, applied, err := sm.localBestEffortLocked(nonce, txs)
+	deferred := sm.takeDeferredLocked()
+	return root, applied, deferred, err
+}
+
+func (sm *StateMachine) dropOrDeferLocked(nonce uint64, tx *types.DevshardTx, err error) {
+	logDroppedTx(nonce, tx, err)
+	if errors.Is(err, types.ErrHeaderPending) {
+		sm.deferred = append(sm.deferred, tx)
+	}
+}
+
+func (sm *StateMachine) takeDeferredLocked() []*types.DevshardTx {
+	out := sm.deferred
+	sm.deferred = nil
+	return out
 }
 
 // PreviewLocalBestEffort is the validate-on-clone form of ApplyLocalBestEffort:
@@ -478,7 +500,7 @@ func (sm *StateMachine) PreviewLocalBestEffort(nonce uint64, txs []*types.Devsha
 	}
 	warmAfter := copyStringMap(sm.state.WarmKeys)
 	sm.detachJournalLocked(j)
-	return &ValidatedDiff{Root: root, WarmAfter: warmAfter, Applied: applied, nonce: nonce, journal: j, obs: obs, marks: marks}, nil
+	return &ValidatedDiff{Root: root, WarmAfter: warmAfter, Applied: applied, Deferred: sm.takeDeferredLocked(), nonce: nonce, journal: j, obs: obs, marks: marks}, nil
 }
 
 // CommitValidated installs a previously validated diff's post-state and flushes
@@ -562,6 +584,7 @@ func (sm *StateMachine) localBestEffortLocked(nonce uint64, txs []*types.Devshar
 // localBestEffortJournaled is localBestEffortLocked that also returns the
 // closed journal of a successful apply.
 func (sm *StateMachine) localBestEffortJournaled(nonce uint64, txs []*types.DevshardTx) ([]byte, []*types.DevshardTx, *mutationJournal, error) {
+	sm.deferred = nil
 	expectedNonce := sm.state.LatestNonce + 1
 	if nonce != expectedNonce {
 		return nil, nil, nil, fmt.Errorf("%w: expected %d, got %d", types.ErrInvalidNonce, expectedNonce, nonce)
@@ -629,14 +652,14 @@ func (sm *StateMachine) localBestEffortJournaled(nonce uint64, txs []*types.Devs
 			continue
 		}
 		if err := sm.checkRaiseResolvableLocked(nonce, tx); err != nil {
-			logDroppedTx(nonce, tx, err)
+			sm.dropOrDeferLocked(nonce, tx, err)
 			continue
 		}
 		if err := sm.applyTxAtomicLocked(tx, nonce); err != nil {
 			if tx.GetStartInference() != nil {
 				return nil, nil, nil, fmt.Errorf("mandatory start inference: %w", err)
 			}
-			logDroppedTx(nonce, tx, err)
+			sm.dropOrDeferLocked(nonce, tx, err)
 			continue
 		}
 		applied = append(applied, tx)

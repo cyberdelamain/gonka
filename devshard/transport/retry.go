@@ -3,6 +3,7 @@ package transport
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strconv"
@@ -12,6 +13,7 @@ import (
 	"connectrpc.com/connect"
 
 	"devshard/transport/rpcpb/rpcpbconnect"
+	"devshard/types"
 )
 
 // Non-inference 429/503 (and transient dial failures) retry with exponential
@@ -90,11 +92,15 @@ func IsStorageBusy(err error) bool {
 	return isUnavailableWithCode(err, DevshardErrorStorageBusy)
 }
 
-// IsHeaderPending reports a host 503 header_pending: a diff's height-sync floor
-// block is not on the host's chain yet. The same request may be resent once
-// the host has seen the block.
 func IsHeaderPending(err error) bool {
 	return isUnavailableWithCode(err, DevshardErrorHeaderPending)
+}
+
+func TagHeaderPending(err error) error {
+	if err == nil || errors.Is(err, types.ErrHeaderPending) || !IsHeaderPending(err) {
+		return err
+	}
+	return fmt.Errorf("%w: %w", types.ErrHeaderPending, err)
 }
 
 func isUnavailableWithCode(err error, code string) bool {

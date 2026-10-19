@@ -846,15 +846,37 @@ Where the time comes from:
   height is light-verified against commit signatures from the last trusted
   header (CometBFT `light.Verify`, trust level 1/3, trusting period 7 days by
   default). An older height is proven by its hash link to a proven header
-  above it. The history (about a week) and the trust point are kept in dapi's
-  SQLite and reloaded on restart. `DAPI_CHAINORACLE_VERIFY_COMMITS=false`
-  turns verification off.
+  above it, including heights older than the in-memory window. The history
+  (about a week) and the trust point are kept in dapi's SQLite with a
+  `verified` flag; verify mode loads only verified rows, and an unverified
+  write never replaces a verified one. A stored trust point that the node
+  cannot serve, or whose block hash differs, or a trust store that cannot be
+  read, stops verification instead of re-trusting the node; only an expired trust point, or
+  `DAPI_CHAINORACLE_RESET_TRUST=true`, starts a new trust root. Each trust root
+  has an epoch; a reset starts a new one, and headers proven under another
+  epoch are never loaded.
+  `DAPI_CHAINORACLE_VERIFY_COMMITS=false` turns verification off.
 - `GetBlockHeader` takes `wait_ms`, so a host asking for a height the chain
   has not produced yet is answered when the block is proven instead of
   polling. The public HTTP `/block/:height` route does not wait.
-- devshardd reads header times only from dapi; it falls back to direct chain
-  gRPC only when dapi is unreachable, never when dapi answers "not found".
+- devshardd reads header times only from dapi. It falls back to direct chain
+  gRPC only when dapi is unreachable at the transport level, never when dapi
+  answers "not found", rejects a header as unproven (`PermissionDenied`), or
+  reports its own failure (`Internal`). gRPC answers are judged by their code,
+  never by the words in their message.
   The gateway, which runs no dapi, light-verifies against its own Comet RPC.
+- A candidate tx the sequencer leaves out only because its header is pending
+  stays queued and is offered again on the next diff. Timeout evidence must
+  pass the same "floor raise is provable" check the sequencer applies, after a
+  short wait for the header, so a Finish stamped at a fabricated height
+  cannot veto a timeout. Evidence whose header is still pending defers the
+  vote only while its height is at most a few blocks past the verifier's own
+  chain tip, and only within one 60 s window per inference counted from the
+  first deferral; a re-signed stamp does not renew it. Further out, or after
+  the window, it is not evidence.
+- An executor that answers a refusal challenge with `header_pending` has
+  answered: it is waiting for a block. The verifier gives no vote for that
+  round instead of treating the executor as unreachable.
 
 This is the §1 motivation applied inward: a deadline that depends on each
 host's clock cannot be agreed on, a block's header time can. Any decision

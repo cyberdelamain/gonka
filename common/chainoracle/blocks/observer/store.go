@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 )
 
 type HeaderStore interface {
@@ -30,22 +31,35 @@ CREATE TABLE IF NOT EXISTS chainoracle_headers (
   hash BLOB NOT NULL,
   prev_hash BLOB,
   time_ms INTEGER NOT NULL,
-  chain_id TEXT NOT NULL DEFAULT ''
+  chain_id TEXT NOT NULL DEFAULT '',
+  verified INTEGER NOT NULL DEFAULT 0,
+  epoch INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS chainoracle_trust (
   id INTEGER PRIMARY KEY CHECK (id = 1),
   height INTEGER NOT NULL,
-  hash BLOB NOT NULL
+  hash BLOB NOT NULL,
+  epoch INTEGER NOT NULL DEFAULT 0
 );`
 	if _, err := db.ExecContext(ctx, schema); err != nil {
 		return nil, fmt.Errorf("observer: header store schema: %w", err)
+	}
+	for _, alter := range []string{
+		`ALTER TABLE chainoracle_headers ADD COLUMN verified INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE chainoracle_headers ADD COLUMN epoch INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE chainoracle_trust ADD COLUMN epoch INTEGER NOT NULL DEFAULT 0`,
+	} {
+		if _, err := db.ExecContext(ctx, alter); err != nil &&
+			!strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+			return nil, fmt.Errorf("observer: header store schema: %w", err)
+		}
 	}
 	return &SQLiteHeaderStore{db: db}, nil
 }
 
 func (s *SQLiteHeaderStore) LoadHeaders(ctx context.Context, fromHeight int64) ([]StoredHeader, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT height, hash, prev_hash, time_ms, chain_id FROM chainoracle_headers WHERE height >= ? ORDER BY height`, fromHeight)
+		`SELECT height, hash, prev_hash, time_ms, chain_id, verified, epoch FROM chainoracle_headers WHERE height >= ? ORDER BY height`, fromHeight)
 	if err != nil {
 		return nil, err
 	}
@@ -53,7 +67,7 @@ func (s *SQLiteHeaderStore) LoadHeaders(ctx context.Context, fromHeight int64) (
 	var out []StoredHeader
 	for rows.Next() {
 		var h StoredHeader
-		if err := rows.Scan(&h.Height, &h.Hash, &h.PrevHash, &h.TimeMs, &h.ChainID); err != nil {
+		if err := rows.Scan(&h.Height, &h.Hash, &h.PrevHash, &h.TimeMs, &h.ChainID, &h.Verified, &h.Epoch); err != nil {
 			return nil, err
 		}
 		out = append(out, h)
@@ -71,10 +85,11 @@ func (s *SQLiteHeaderStore) SaveHeaders(ctx context.Context, headers []StoredHea
 	}
 	defer func() { _ = tx.Rollback() }()
 	stmt, err := tx.PrepareContext(ctx,
-		`INSERT INTO chainoracle_headers (height, hash, prev_hash, time_ms, chain_id) VALUES (?, ?, ?, ?, ?)
+		`INSERT INTO chainoracle_headers (height, hash, prev_hash, time_ms, chain_id, verified, epoch) VALUES (?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(height) DO UPDATE SET hash = excluded.hash,
   prev_hash = COALESCE(excluded.prev_hash, chainoracle_headers.prev_hash),
-  time_ms = excluded.time_ms, chain_id = excluded.chain_id`)
+  time_ms = excluded.time_ms, chain_id = excluded.chain_id, verified = excluded.verified, epoch = excluded.epoch
+WHERE excluded.verified = 1 OR chainoracle_headers.verified = 0`)
 	if err != nil {
 		return err
 	}
@@ -84,7 +99,7 @@ ON CONFLICT(height) DO UPDATE SET hash = excluded.hash,
 		if len(h.PrevHash) > 0 {
 			prev = h.PrevHash
 		}
-		if _, err := stmt.ExecContext(ctx, h.Height, h.Hash, prev, h.TimeMs, h.ChainID); err != nil {
+		if _, err := stmt.ExecContext(ctx, h.Height, h.Hash, prev, h.TimeMs, h.ChainID, h.Verified, h.Epoch); err != nil {
 			return err
 		}
 	}
@@ -98,7 +113,7 @@ func (s *SQLiteHeaderStore) PruneHeaders(ctx context.Context, belowHeight int64)
 
 func (s *SQLiteHeaderStore) LoadTrust(ctx context.Context) (TrustPoint, bool, error) {
 	var tp TrustPoint
-	err := s.db.QueryRowContext(ctx, `SELECT height, hash FROM chainoracle_trust WHERE id = 1`).Scan(&tp.Height, &tp.Hash)
+	err := s.db.QueryRowContext(ctx, `SELECT height, hash, epoch FROM chainoracle_trust WHERE id = 1`).Scan(&tp.Height, &tp.Hash, &tp.Epoch)
 	if errors.Is(err, sql.ErrNoRows) {
 		return TrustPoint{}, false, nil
 	}
@@ -110,8 +125,8 @@ func (s *SQLiteHeaderStore) LoadTrust(ctx context.Context) (TrustPoint, bool, er
 
 func (s *SQLiteHeaderStore) SaveTrust(ctx context.Context, tp TrustPoint) error {
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO chainoracle_trust (id, height, hash) VALUES (1, ?, ?)
-ON CONFLICT(id) DO UPDATE SET height = excluded.height, hash = excluded.hash`, tp.Height, tp.Hash)
+		`INSERT INTO chainoracle_trust (id, height, hash, epoch) VALUES (1, ?, ?, ?)
+ON CONFLICT(id) DO UPDATE SET height = excluded.height, hash = excluded.hash, epoch = excluded.epoch`, tp.Height, tp.Hash, tp.Epoch)
 	return err
 }
 

@@ -292,6 +292,19 @@ func permanentNMSkip(err error) bool {
 	return false
 }
 
+func nmTransportStatus(err error) bool {
+	st, ok := status.FromError(err)
+	if !ok {
+		return false
+	}
+	switch st.Code() {
+	case codes.Unavailable, codes.DeadlineExceeded, codes.ResourceExhausted:
+		return true
+	default:
+		return false
+	}
+}
+
 func transientNM(err error) bool {
 	if err == nil {
 		return false
@@ -300,6 +313,8 @@ func transientNM(err error) bool {
 		switch st.Code() {
 		case codes.Unavailable, codes.DeadlineExceeded, codes.ResourceExhausted:
 			return true
+		default:
+			return false
 		}
 	}
 	text := strings.ToLower(err.Error())
@@ -420,12 +435,6 @@ func (o *Oracle) HeaderAt(ctx context.Context, height int64) (*blocks.Header, er
 	return cloneHeader(h), nil
 }
 
-// HeaderAtWait reads one height for a header-time decision. It asks the
-// NodeManager first and waits up to wait for a height that is not out yet.
-// The local NewBlock window is skipped: it is the unverified Comet feed, and
-// dapi may be serving only light-verified headers. Direct chain gRPC is used
-// only when the NodeManager is absent or failing, never to second-guess a
-// NodeManager that answered "not found".
 func (o *Oracle) HeaderAtWait(ctx context.Context, height int64, wait time.Duration) (*blocks.Header, error) {
 	if o == nil || height <= 0 {
 		return blocks.DummyHeader(height), nil
@@ -444,12 +453,16 @@ func (o *Oracle) HeaderAtWait(ctx context.Context, height int64, wait time.Durat
 			o.noteNMOutcome(now, h, nil)
 			return cloneHeader(h), nil
 		}
+		if errors.Is(err, blocks.ErrHeaderUnverified) {
+			return nil, err
+		}
 		if err == nil || errors.Is(err, blocks.ErrHeaderNotFound) {
 			return blocks.DummyHeader(height), nil
 		}
-		if permanentNMSkip(err) || transientNM(err) {
-			o.noteNMOutcome(now, nil, err)
+		if !permanentNMSkip(err) && !nmTransportStatus(err) {
+			return nil, err
 		}
+		o.noteNMOutcome(now, nil, err)
 	}
 	if o.chain == nil {
 		return blocks.DummyHeader(height), nil

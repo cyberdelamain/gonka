@@ -21,7 +21,7 @@ import (
 const (
 	MaxAtWait           = 30 * time.Second
 	atWaitPoll          = 500 * time.Millisecond
-	maxFillPerCall      = 4000
+	maxFillPerCall      = 20_000
 	maxTipGapFill       = 1000
 	historyLoadTimeout  = 30 * time.Second
 	storeWriteQueue     = 256
@@ -41,6 +41,7 @@ type TendermintConfig struct {
 	TrustingPeriod time.Duration
 	Store          HeaderStore
 	HistoryHeights int64
+	ResetTrust     bool
 }
 
 type headerRPC interface {
@@ -49,9 +50,7 @@ type headerRPC interface {
 
 // Oracle is a hash-only BlockOracle. Tip is pushed via Observe (Comet
 // NewBlock). At() is the last tipcache.HistoryWindow heights, then Comet
-// Header RPC (LoadBlockMeta — not Block / LoadBlock). With VerifyCommits,
-// At() serves only headers proven by commit signatures or by a hash link
-// to a proven header.
+// Header RPC (LoadBlockMeta — not Block / LoadBlock).
 type Oracle struct {
 	rpc      headerRPC
 	cache    *tipcache.Cache
@@ -69,6 +68,7 @@ type oracleOptions struct {
 	trustingPeriod time.Duration
 	store          HeaderStore
 	historyHeights int64
+	resetTrust     bool
 }
 
 // NewTendermint builds an Oracle against cfg.RPCURL. It does not start a
@@ -86,6 +86,7 @@ func NewTendermint(cfg TendermintConfig) (*Oracle, error) {
 		trustingPeriod: cfg.TrustingPeriod,
 		store:          cfg.Store,
 		historyHeights: cfg.HistoryHeights,
+		resetTrust:     cfg.ResetTrust,
 	}), nil
 }
 
@@ -108,8 +109,13 @@ func newOracleWith(rpc headerRPC, opts oracleOptions) *Oracle {
 	if o.store != nil {
 		o.writes = make(chan []StoredHeader, storeWriteQueue)
 		go o.runStoreWriter()
-		o.loadFromStore()
-		if o.verifier != nil {
+		if o.verifier == nil {
+			o.loadFromStore(nil)
+		} else {
+			o.verifier.loadTrust = o.store.LoadTrust
+			o.verifier.storeTrust = o.store.SaveTrust
+			o.verifier.resetTrust = opts.resetTrust
+			o.verifier.onEpoch = func(epoch int64) { o.loadFromStore(&epoch) }
 			o.verifier.saveTrust = func(tp TrustPoint) {
 				ctx, cancel := context.WithTimeout(context.Background(), historyStoreTimeout)
 				defer cancel()
@@ -120,16 +126,22 @@ func newOracleWith(rpc headerRPC, opts oracleOptions) *Oracle {
 		}
 	}
 	if o.verifier != nil {
+		if o.store != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), historyLoadTimeout)
+			if err := o.verifier.prepareTrust(ctx); err != nil {
+				logging.Warn("chainoracle: trust point not read yet; verification waits", "chainoracle", "error", err)
+			}
+			cancel()
+		}
 		o.verifyQ = make(chan int64, 1)
 		go o.runVerifier()
 	}
 	return o
 }
 
-// Verifying reports whether At serves only light-verified headers.
 func (o *Oracle) Verifying() bool { return o != nil && o.verifier != nil }
 
-func (o *Oracle) loadFromStore() {
+func (o *Oracle) loadFromStore(epoch *int64) {
 	ctx, cancel := context.WithTimeout(context.Background(), historyLoadTimeout)
 	defer cancel()
 	top, err := o.store.MaxHeight(ctx)
@@ -146,15 +158,16 @@ func (o *Oracle) loadFromStore() {
 		logging.Warn("chainoracle: load header history", "chainoracle", "error", err)
 		return
 	}
+	loaded := 0
 	for _, r := range rows {
-		o.history.PutStored(r)
-	}
-	if o.verifier != nil {
-		if tp, ok, err := o.store.LoadTrust(ctx); err == nil && ok {
-			o.verifier.pin(tp)
+		if epoch != nil && (!r.Verified || r.Epoch != *epoch) {
+			continue
+		}
+		if o.history.PutStored(r) {
+			loaded++
 		}
 	}
-	logging.Info("chainoracle: header history loaded", "chainoracle", "headers", len(rows), "top", top)
+	logging.Info("chainoracle: header history loaded", "chainoracle", "headers", loaded, "stored", len(rows), "top", top)
 }
 
 func (o *Oracle) runStoreWriter() {
@@ -180,6 +193,9 @@ func (o *Oracle) runStoreWriter() {
 func (o *Oracle) remember(rows ...StoredHeader) {
 	var kept []StoredHeader
 	for _, r := range rows {
+		if r.Verified && o.verifier != nil {
+			r.Epoch = o.verifier.epoch.Load()
+		}
 		if o.history.PutStored(r) {
 			kept = append(kept, r)
 		}
@@ -206,7 +222,7 @@ func (o *Oracle) runVerifier() {
 			}
 		}
 		if lastTop > 0 && height-lastTop > 1 && height-lastTop <= maxTipGapFill {
-			_ = o.fillDown(ctx, lastTop+1)
+			_, _ = o.fillDown(ctx, lastTop+1)
 		}
 		lastTop = height
 		cancel()
@@ -284,8 +300,6 @@ func (o *Oracle) At(ctx context.Context, height int64) (*blocks.Header, error) {
 	return o.fetchHeader(ctx, &height, false)
 }
 
-// AtWait is At for a height the chain may not have produced yet: it waits up
-// to wait (capped at MaxAtWait) for the header instead of answering not found.
 func (o *Oracle) AtWait(ctx context.Context, height int64, wait time.Duration) (*blocks.Header, error) {
 	if wait > MaxAtWait {
 		wait = MaxAtWait
@@ -320,77 +334,80 @@ func (o *Oracle) verifiedAt(ctx context.Context, height int64) (*blocks.Header, 
 	if err != nil {
 		return nil, err
 	}
-	o.remember(storedFromHeader(trusted))
+	o.remember(verifiedFromHeader(trusted))
 	if height >= trusted.Height {
 		hdr, err := o.verifier.verifyForward(ctx, height)
 		if err == nil {
-			o.remember(storedFromHeader(hdr))
-			if h, ok := o.history.Get(height); ok {
-				return h, nil
-			}
-			return nil, blocks.ErrHeaderNotFound
+			row := verifiedFromHeader(hdr)
+			o.remember(row)
+			return o.headerFromRow(row), nil
 		}
 		if !errors.Is(err, errBelowTrusted) {
 			return nil, err
 		}
 	}
-	if err := o.fillDown(ctx, height); err != nil {
-		return nil, err
+	return o.fillDown(ctx, height)
+}
+
+func (o *Oracle) headerFromRow(r StoredHeader) *blocks.Header {
+	chainID := r.ChainID
+	if chainID == "" {
+		chainID = o.history.ChainID()
 	}
+	return blocks.HashOnlyHeader(r.Height, time.UnixMilli(r.TimeMs).UTC(), chainID, r.Hash)
+}
+
+func (o *Oracle) fillDown(ctx context.Context, height int64) (*blocks.Header, error) {
+	o.fillMu.Lock()
+	defer o.fillMu.Unlock()
 	if h, ok := o.history.Get(height); ok {
 		return h, nil
 	}
-	return nil, blocks.ErrHeaderNotFound
-}
-
-func (o *Oracle) fillDown(ctx context.Context, height int64) error {
-	o.fillMu.Lock()
-	defer o.fillMu.Unlock()
 	rpc, ok := o.rpc.(blockchainInfoRPC)
 	if !ok {
-		return blocks.ErrHeaderNotFound
+		return nil, blocks.ErrHeaderNotFound
 	}
+	nextHeight, next, ok := o.history.lowestLinkedAbove(height)
+	if !ok {
+		return nil, blocks.ErrHeaderNotFound
+	}
+	chainID := o.history.ChainID()
 	filled := 0
 	for filled < maxFillPerCall {
-		if _, ok := o.history.entry(height); ok {
-			return nil
-		}
 		if err := ctx.Err(); err != nil {
-			return err
-		}
-		nextHeight, next, ok := o.history.lowestLinkedAbove(height)
-		if !ok {
-			return blocks.ErrHeaderNotFound
+			return nil, err
 		}
 		lo := max(height, nextHeight-BlockchainInfoBatch)
 		res, err := rpc.BlockchainInfo(ctx, lo, nextHeight-1)
 		if err != nil {
 			if isCometHeightErr(err) {
-				return blocks.ErrHeaderNotFound
+				return nil, blocks.ErrHeaderNotFound
 			}
-			return fmt.Errorf("observer: blockchain info rpc: %w", err)
+			return nil, fmt.Errorf("observer: blockchain info rpc: %w", err)
 		}
-		hdrs := headersFromBlockchainInfo(res)
-		byHeight := make(map[int64]*cmttypes.Header, len(hdrs))
-		for _, h := range hdrs {
+		byHeight := make(map[int64]*cmttypes.Header, BlockchainInfoBatch)
+		for _, h := range headersFromBlockchainInfo(res) {
 			byHeight[h.Height] = h
 		}
-		chainID := o.history.ChainID()
 		var rows []StoredHeader
 		for cur := nextHeight - 1; cur >= lo; cur-- {
 			hdr := byHeight[cur]
 			if err := verifyBackwardLink(hdr, next, cur+1, chainID); err != nil {
 				o.remember(rows...)
-				return err
+				return nil, err
 			}
-			row := storedFromHeader(hdr)
+			row := verifiedFromHeader(hdr)
 			rows = append(rows, row)
 			next = historyEntry{hash: row.Hash, prevHash: row.PrevHash, timeMs: row.TimeMs}
+			nextHeight = cur
 		}
 		o.remember(rows...)
 		filled += len(rows)
+		if nextHeight == height && len(rows) > 0 {
+			return o.headerFromRow(rows[len(rows)-1]), nil
+		}
 	}
-	return blocks.ErrHeaderNotFound
+	return nil, blocks.ErrHeaderNotFound
 }
 
 func (o *Oracle) fetchBatch(ctx context.Context, height int64) (*blocks.Header, bool) {

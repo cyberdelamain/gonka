@@ -3,6 +3,7 @@ package headertime
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -115,6 +116,26 @@ func (s *Source) HeaderTimeMs(height uint64, hash []byte) (int64, error) {
 		return 0, fmt.Errorf("%w: height %d", types.ErrHeaderPending, height)
 	}
 	return checkEntry(height, hash, e)
+}
+
+func (s *Source) AwaitHeaderTimeMs(ctx context.Context, height uint64, hash []byte) (int64, error) {
+	for {
+		ms, err := s.HeaderTimeMs(height, hash)
+		if !errors.Is(err, types.ErrHeaderPending) {
+			return ms, err
+		}
+		s.mu.Lock()
+		done, running := s.inflight[height]
+		s.mu.Unlock()
+		if !running {
+			return ms, err
+		}
+		select {
+		case <-ctx.Done():
+			return 0, err
+		case <-done:
+		}
+	}
 }
 
 func (s *Source) fetchInto(height uint64, done chan struct{}) {

@@ -33,23 +33,29 @@ type StoredHeader struct {
 	PrevHash []byte
 	TimeMs   int64
 	ChainID  string
+	Verified bool
+	Epoch    int64
 }
+
+const DefaultDeepHeights = 32_768
 
 type History struct {
 	window int64
 
-	mu      sync.RWMutex
-	chainID string
-	top     int64
-	entries map[int64]historyEntry
-	changed chan struct{}
+	mu        sync.RWMutex
+	chainID   string
+	top       int64
+	entries   map[int64]historyEntry
+	deep      map[int64]historyEntry
+	deepOrder []int64
+	changed   chan struct{}
 }
 
 func NewHistory(window int64) *History {
 	if window <= 0 {
 		window = DefaultHistoryHeights
 	}
-	return &History{window: window, entries: make(map[int64]historyEntry), changed: make(chan struct{})}
+	return &History{window: window, entries: make(map[int64]historyEntry), deep: make(map[int64]historyEntry), changed: make(chan struct{})}
 }
 
 func (h *History) Put(hdr *blocks.Header) bool {
@@ -68,11 +74,26 @@ func (h *History) PutStored(s StoredHeader) bool {
 	if s.ChainID != "" {
 		h.chainID = s.ChainID
 	}
+	e := historyEntry{hash: append([]byte(nil), s.Hash...), prevHash: append([]byte(nil), s.PrevHash...), timeMs: s.TimeMs}
 	if h.top > 0 && s.Height <= h.top-h.window {
-		return false
+		if prev, had := h.deep[s.Height]; had {
+			if len(e.prevHash) == 0 {
+				e.prevHash = prev.prevHash
+			}
+		} else {
+			h.deepOrder = append(h.deepOrder, s.Height)
+		}
+		h.deep[s.Height] = e
+		if len(h.deepOrder) > DefaultDeepHeights {
+			drop := len(h.deepOrder) - DefaultDeepHeights
+			for _, old := range h.deepOrder[:drop] {
+				delete(h.deep, old)
+			}
+			h.deepOrder = append([]int64(nil), h.deepOrder[drop:]...)
+		}
+		return true
 	}
 	prev, had := h.entries[s.Height]
-	e := historyEntry{hash: append([]byte(nil), s.Hash...), prevHash: append([]byte(nil), s.PrevHash...), timeMs: s.TimeMs}
 	if had && len(e.prevHash) == 0 {
 		e.prevHash = prev.prevHash
 	}
@@ -101,7 +122,14 @@ func (h *History) evictLocked() {
 func (h *History) entry(height int64) (historyEntry, bool) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
-	e, ok := h.entries[height]
+	return h.lookupLocked(height)
+}
+
+func (h *History) lookupLocked(height int64) (historyEntry, bool) {
+	if e, ok := h.entries[height]; ok {
+		return e, true
+	}
+	e, ok := h.deep[height]
 	return e, ok
 }
 
@@ -111,7 +139,7 @@ func (h *History) Get(height int64) (*blocks.Header, bool) {
 	}
 	h.mu.RLock()
 	defer h.mu.RUnlock()
-	e, ok := h.entries[height]
+	e, ok := h.lookupLocked(height)
 	if !ok {
 		return nil, false
 	}
@@ -140,7 +168,7 @@ func (h *History) lowestLinkedAbove(height int64) (int64, historyEntry, bool) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	for next := height + 1; next <= h.top; next++ {
-		if e, ok := h.entries[next]; ok {
+		if e, ok := h.lookupLocked(next); ok {
 			if len(e.prevHash) == 0 {
 				return 0, historyEntry{}, false
 			}
@@ -167,6 +195,12 @@ func storedFromHeader(hdr *cmttypes.Header) StoredHeader {
 		TimeMs:   hdr.Time.UnixMilli(),
 		ChainID:  hdr.ChainID,
 	}
+}
+
+func verifiedFromHeader(hdr *cmttypes.Header) StoredHeader {
+	row := storedFromHeader(hdr)
+	row.Verified = true
+	return row
 }
 
 func headersFromBlockchainInfo(res *ctypes.ResultBlockchainInfo) []*cmttypes.Header {

@@ -9,6 +9,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"devshard/internal/testutil"
 	"devshard/types"
 )
 
@@ -210,4 +211,61 @@ func TestReplayGivesUpOnAHeaderThatNeverArrives(t *testing.T) {
 	})
 	require.ErrorIs(t, err, types.ErrHeaderPending)
 	require.Equal(t, nonce-1, d.sm.LatestNonce(), "a failed attempt leaves no partial apply behind")
+}
+
+func (d *floorDriver) stampedFinish(id, height uint64, hash []byte) *types.DevshardTx {
+	d.t.Helper()
+	rec, ok := d.sm.GetInference(id)
+	require.True(d.t, ok)
+	finish := &types.MsgFinishInference{
+		InferenceId: id, ResponseHash: testutil.TestResponseHash, ServedHash: testutil.TestServedHash,
+		InputTokens: 10, OutputTokens: 20, ExecutorSlot: rec.ExecutorSlot, EscrowId: "escrow-1",
+		ObservedHeight: height, ObservedBlockHash: hash,
+	}
+	finish.ProposerSig = testutil.SignProposerTx(d.t, d.hosts[rec.ExecutorSlot], finish)
+	return txFinish(finish)
+}
+
+func startedUnderHeaderTimes(t *testing.T) (*floorDriver, *headerTimes, uint64) {
+	d, src := newHeaderTimeDriver(t)
+	hash := []byte{0x01, 0x00}
+	src.set(100, time.Hour)
+	d.raise(100, hash)
+	id := d.next()
+	require.NoError(t, d.start(id, 100, hash))
+	require.NoError(t, d.apply(d.confirm(id, 100, hash)))
+	return d, src, id
+}
+
+func TestEvidenceRejectsAFinishWhoseFloorRaiseCannotBeProven(t *testing.T) {
+	d, src, id := startedUnderHeaderTimes(t)
+	rec, ok := d.sm.GetInference(id)
+	require.True(t, ok)
+	fake := d.stampedFinish(id, 1_000_000, []byte{0x0f, 0x00})
+
+	require.ErrorIs(t, d.sm.CheckEvidence(&rec, fake), types.ErrHeaderPending,
+		"evidence the gateway could never sequence cannot veto a timeout")
+
+	src.set(1_000_000, 2*time.Hour)
+	require.NoError(t, d.sm.CheckEvidence(&rec, fake), "once the block is proven the same Finish is evidence")
+}
+
+func TestComposeKeepsAFinishWhoseHeaderIsOnlyLate(t *testing.T) {
+	d, src, id := startedUnderHeaderTimes(t)
+	finish := d.stampedFinish(id, 200, []byte{0x02, 0x00})
+
+	nonce := d.next()
+	_, applied, deferred, err := d.sm.ApplyLocalBestEffortDeferred(nonce, []*types.DevshardTx{finish, divHeartbeatTx(0, nil)})
+	require.NoError(t, err)
+	require.Len(t, applied, 1)
+	require.Len(t, deferred, 1, "a Finish waiting on a header is deferred, not discarded")
+	require.Equal(t, types.TxHash(finish), types.TxHash(deferred[0]))
+
+	src.set(200, 2*time.Hour)
+	_, applied, deferred, err = d.sm.ApplyLocalBestEffortDeferred(d.next(), deferred)
+	require.NoError(t, err)
+	require.Len(t, applied, 1)
+	require.Empty(t, deferred)
+	rec, _ := d.sm.GetInference(id)
+	require.Equal(t, types.StatusFinished, rec.Status)
 }

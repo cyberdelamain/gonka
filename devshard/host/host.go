@@ -186,7 +186,8 @@ type Host struct {
 	maxNonce devshard.MaxNonceProvider // nil = do not enforce
 
 	// oracle is optional mainnet height source. LatestHeight returns ErrNoChainOracle when nil.
-	oracle blocks.BlockOracle
+	oracle            blocks.BlockOracle
+	evidenceDeferrals evidenceDeferrals
 
 	// peerSeen and heartbeatCfg serve host-signed height acks (spec §10.4).
 	// peerSeen is the spec §11.2 bitmap (Diff acks and repair HEIGHT).

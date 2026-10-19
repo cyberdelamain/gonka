@@ -2,6 +2,7 @@ package state
 
 import (
 	"context"
+	"devshard/heightsync"
 	"devshard/types"
 	"errors"
 	"time"
@@ -9,6 +10,31 @@ import (
 
 type HeaderTimeSource interface {
 	HeaderTimeMs(height uint64, hash []byte) (int64, error)
+}
+
+type HeaderTimeAwaiter interface {
+	AwaitHeaderTimeMs(ctx context.Context, height uint64, hash []byte) (int64, error)
+}
+
+const EvidenceHeaderWait = 5 * time.Second
+
+func (sm *StateMachine) awaitRaiseHeaders(txs []*types.DevshardTx) {
+	awaiter, ok := sm.headerTimes.(HeaderTimeAwaiter)
+	if !ok {
+		return
+	}
+	sm.mu.RLock()
+	cur, _ := sm.heightSyncFloor.Max()
+	claims := floorClaims(sm.state, txs)
+	sm.mu.RUnlock()
+	ctx, cancel := context.WithTimeout(context.Background(), EvidenceHeaderWait)
+	defer cancel()
+	for _, c := range claims {
+		if c.Signer == heightsync.SequencerSigner || c.Height <= cur || !heightsync.StampPresent(c.Hash) {
+			continue
+		}
+		_, _ = awaiter.AwaitHeaderTimeMs(ctx, c.Height, c.Hash)
+	}
 }
 
 var fallbackHeaderTimes HeaderTimeSource

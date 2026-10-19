@@ -22,6 +22,8 @@ var ErrHeaderNotFound = errors.New("blockoracle: header not found")
 // next GetBlockHeader re-probe (15m).
 var ErrHeaderRPCUnimplemented = errors.New("blockoracle: header rpc unimplemented")
 
+var ErrHeaderUnverified = errors.New("blockoracle: header failed verification")
+
 // BlockOracle is the stable contract between producers (observers, the
 // standalone binary, the in-process dapi mount) and consumers (devshardd
 // hosts, real dapi internals).
@@ -36,8 +38,6 @@ type BlockOracle interface {
 	Subscribe(ctx context.Context, fromHeight int64) (<-chan *Header, error)
 }
 
-// HeaderWaiter is a BlockOracle that can wait for a height the chain has
-// not produced yet instead of answering ErrHeaderNotFound at once.
 type HeaderWaiter interface {
 	AtWait(ctx context.Context, height int64, wait time.Duration) (*Header, error)
 }

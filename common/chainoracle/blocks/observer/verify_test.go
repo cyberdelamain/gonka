@@ -12,9 +12,9 @@ import (
 	"common/chainoracle/blocks"
 
 	"github.com/cometbft/cometbft/crypto/tmhash"
-	ctypes "github.com/cometbft/cometbft/rpc/core/types"
 	cmtproto "github.com/cometbft/cometbft/proto/tendermint/types"
 	cmtversion "github.com/cometbft/cometbft/proto/tendermint/version"
+	ctypes "github.com/cometbft/cometbft/rpc/core/types"
 	cmttypes "github.com/cometbft/cometbft/types"
 	"github.com/cometbft/cometbft/version"
 	"github.com/stretchr/testify/require"
@@ -407,4 +407,127 @@ func TestVerifyReusesAnUnchangedValidatorSet(t *testing.T) {
 		require.NoError(t, err)
 	}
 	require.Equal(t, before, c.calls.Load(), "the validator set is fetched only when its hash changes")
+}
+
+func TestRestartKeepsATrustPinTheNodeDoesNotMatch(t *testing.T) {
+	honest := newSignedChain(t, 100)
+	store := newMemStore()
+	o := verifyingOracle(honest, store)
+	_, err := o.At(context.Background(), 100)
+	require.NoError(t, err)
+	require.Eventually(t, func() bool { _, ok, _ := store.LoadTrust(context.Background()); return ok }, 2*time.Second, 10*time.Millisecond)
+	pinned, _, _ := store.LoadTrust(context.Background())
+
+	forged := newSignedChain(t, 150)
+	store.mu.Lock()
+	store.headers = make(map[int64]StoredHeader)
+	store.mu.Unlock()
+	restarted := verifyingOracle(forged, store)
+	_, err = restarted.At(context.Background(), 150)
+	require.ErrorIs(t, err, ErrUnverifiedHeader, "a node whose chain does not contain the pinned block is not trusted")
+	_, err = restarted.At(context.Background(), 150)
+	require.ErrorIs(t, err, ErrUnverifiedHeader, "the pin is kept, so a retry refuses again")
+	tp, _, _ := store.LoadTrust(context.Background())
+	require.Equal(t, pinned, tp)
+
+	reset := newOracleWith(forged, oracleOptions{verify: true, store: store, resetTrust: true})
+	_, err = reset.At(context.Background(), 150)
+	require.NoError(t, err, "an operator reset starts a new trust root")
+}
+
+func TestVerifyModeIgnoresRowsStoredWithoutVerification(t *testing.T) {
+	c := newSignedChain(t, 100)
+	store := newMemStore()
+	tampered := c.blockTime(90).Add(10 * time.Minute)
+	require.NoError(t, store.SaveHeaders(context.Background(), []StoredHeader{
+		{Height: 90, Hash: c.headers[90].Hash().Bytes(), TimeMs: tampered.UnixMilli(), ChainID: signedChainID},
+	}))
+	o := verifyingOracle(c, store)
+	h, err := o.At(context.Background(), 90)
+	require.NoError(t, err)
+	require.True(t, c.blockTime(90).Equal(h.Time), "the unverified row's time is not served")
+	require.Positive(t, c.commitCalls.Load())
+}
+
+func TestVerifiedAtReachesHeightsOlderThanTheWindow(t *testing.T) {
+	c := newSignedChain(t, 200)
+	o := newOracleWith(c, oracleOptions{verify: true, historyHeights: 5})
+	ctx := context.Background()
+
+	h, err := o.At(ctx, 30)
+	require.NoError(t, err)
+	require.True(t, c.blockTime(30).Equal(h.Time))
+	batches := c.batchCalls.Load()
+	require.LessOrEqual(t, batches, int64(10), "170 heights take nine batches")
+
+	h, err = o.At(ctx, 25)
+	require.NoError(t, err)
+	require.True(t, c.blockTime(25).Equal(h.Time))
+	require.Equal(t, batches+1, c.batchCalls.Load(), "the walk resumes from the last proven old height")
+}
+
+type flakyTrustStore struct {
+	*memStore
+	failReads atomic.Bool
+	saves     atomic.Int64
+}
+
+func (f *flakyTrustStore) LoadTrust(ctx context.Context) (TrustPoint, bool, error) {
+	if f.failReads.Load() {
+		return TrustPoint{}, false, errors.New("database is locked")
+	}
+	return f.memStore.LoadTrust(ctx)
+}
+
+func (f *flakyTrustStore) SaveTrust(ctx context.Context, tp TrustPoint) error {
+	f.saves.Add(1)
+	return f.memStore.SaveTrust(ctx, tp)
+}
+
+func TestAnUnreadableTrustStoreBlocksBootstrapInsteadOfRetrusting(t *testing.T) {
+	honest := newSignedChain(t, 100)
+	base := newMemStore()
+	first := verifyingOracle(honest, base)
+	_, err := first.At(context.Background(), 100)
+	require.NoError(t, err)
+	require.Eventually(t, func() bool { _, ok, _ := base.LoadTrust(context.Background()); return ok }, 2*time.Second, 10*time.Millisecond)
+	pinned, _, _ := base.LoadTrust(context.Background())
+
+	store := &flakyTrustStore{memStore: base}
+	store.failReads.Store(true)
+	forged := newSignedChain(t, 150)
+	restarted := verifyingOracle(forged, store)
+	_, err = restarted.At(context.Background(), 150)
+	require.ErrorContains(t, err, "read trust point")
+	require.Zero(t, store.saves.Load(), "nothing overwrites the pin while it cannot be read")
+
+	store.failReads.Store(false)
+	_, err = restarted.At(context.Background(), 150)
+	require.ErrorIs(t, err, ErrUnverifiedHeader, "once readable, the pin still refuses the other fork")
+	tp, _, _ := base.LoadTrust(context.Background())
+	require.Equal(t, pinned, tp)
+}
+
+func TestTrustResetDoesNotServeHeadersFromTheOldRoot(t *testing.T) {
+	first := newSignedChain(t, 100)
+	store := newMemStore()
+	o := verifyingOracle(first, store)
+	_, err := o.At(context.Background(), 60)
+	require.NoError(t, err)
+	require.Eventually(t, func() bool { return store.has(60) }, 2*time.Second, 10*time.Millisecond)
+
+	second := newSignedChain(t, 120)
+	reset := newOracleWith(second, oracleOptions{verify: true, store: store, resetTrust: true})
+	h, err := reset.At(context.Background(), 60)
+	require.NoError(t, err)
+	require.Equal(t, second.headers[60].Hash().Bytes(), h.BlockHash, "height 60 comes from the new root, not the old cache")
+	tp, ok, err := store.LoadTrust(context.Background())
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, int64(1), tp.Epoch)
+
+	again := verifyingOracle(second, store)
+	h, err = again.At(context.Background(), 60)
+	require.NoError(t, err)
+	require.Equal(t, second.headers[60].Hash().Bytes(), h.BlockHash, "the next restart keeps the new epoch")
 }

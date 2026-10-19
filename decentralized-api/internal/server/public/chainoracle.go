@@ -17,9 +17,7 @@ import (
 
 // NewChainOracle builds the production oracle, or (nil, nil) when the mount
 // is disabled or chain_node.url is empty. Tip is Observe from the dapi
-// NewBlock listener. With commit verification (the default) At() serves only
-// light-verified headers. db, when non-nil, persists the header history and
-// the trust point across restarts.
+// NewBlock listener; At() serves light-verified headers, stored in db.
 func NewChainOracle(rpcURL string, db *sql.DB) (*observer.Oracle, error) {
 	if chainOracleDisabled() {
 		logging.Info("chainoracle skipped (DAPI_CHAINORACLE_DISABLED)", types.Server)
@@ -34,6 +32,7 @@ func NewChainOracle(rpcURL string, db *sql.DB) (*observer.Oracle, error) {
 		RPCURL:         rpcURL,
 		VerifyCommits:  chainOracleVerifyCommits(),
 		TrustingPeriod: chainOracleTrustingPeriod(),
+		ResetTrust:     chainOracleResetTrust(),
 	}
 	if db != nil {
 		store, err := observer.NewSQLiteHeaderStore(context.Background(), db)
@@ -57,6 +56,15 @@ func chainOracleVerifyCommits() bool {
 		return false
 	default:
 		return true
+	}
+}
+
+func chainOracleResetTrust() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("DAPI_CHAINORACLE_RESET_TRUST"))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
 	}
 }
 

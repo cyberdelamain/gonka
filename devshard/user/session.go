@@ -1362,7 +1362,7 @@ func (s *Session) composeDiffLockedInclude(ctx context.Context, extraTxs []*type
 		s.diffs = append(s.diffs, diff)
 		s.nonce = nonce
 		s.dropDiffPrefixLocked()
-		s.retainPendingLocked(held, vd.Applied)
+		s.retainPendingLocked(append(held, vd.Deferred...), vd.Applied)
 		s.maybeSaveSnapshotLocked()
 		s.observeTurnLocked(diff)
 		s.diffObserver(diff)
@@ -1370,10 +1370,11 @@ func (s *Session) composeDiffLockedInclude(ctx context.Context, extraTxs []*type
 		return diff, hostIdx, nil
 	}
 
-	postStateRoot, applied, err := s.sm.ApplyLocalBestEffort(nonce, candidates)
+	postStateRoot, applied, deferred, err := s.sm.ApplyLocalBestEffortDeferred(nonce, candidates)
 	if err != nil {
 		return types.Diff{}, 0, fmt.Errorf("local apply: %w", err)
 	}
+	held = append(held, deferred...)
 	diff, err = s.signDiff(nonce, applied, postStateRoot)
 	if err != nil {
 		return types.Diff{}, 0, err

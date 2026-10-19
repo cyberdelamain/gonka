@@ -334,6 +334,9 @@ func classifyChallenge(outcome refusedChallenge, err error, unreachable func(err
 		if !errors.As(err, &call) {
 			return false, true, err
 		}
+		if errors.Is(call.err, types.ErrHeaderPending) {
+			return false, true, call.err
+		}
 		if unreachable(call.err) {
 			return true, true, nil
 		}
@@ -426,7 +429,7 @@ func challengeOnce(
 		return outcome, err
 	}
 	releaseColdWalk(ctx)
-	if unreachable(catchUp.err) {
+	if errors.Is(catchUp.err, types.ErrHeaderPending) || unreachable(catchUp.err) {
 		return 0, &executorCallError{err: catchUp.err}
 	}
 	return finishPayload(ctx, st.EscrowID, inferenceID, rec, payload, nil, executorClient, ingest, ev, unreachable)

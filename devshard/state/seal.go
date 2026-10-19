@@ -38,7 +38,7 @@ func shouldAutoSealAtNonce(interval uint64, nonce uint64) bool {
 }
 
 // FinishedClockRequiredSeconds is the Finished (Trigger C) clock-gate
-// threshold in seconds, before it is converted to blocks.
+// threshold in seconds, compared against confirm block times in ms.
 // ExecutionTimeout is the session inference timeout anchored at ConfirmStart;
 // adding it leaves InferenceSealGraceSeconds after the latest legal Finish.
 func FinishedClockRequiredSeconds(graceSeconds, executionTimeout int64) int64 {

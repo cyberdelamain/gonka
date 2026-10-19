@@ -1165,3 +1165,29 @@ func TestScreenCatchUpPageRejectsDamagedFraming(t *testing.T) {
 	})
 	require.Zero(t, allocs)
 }
+
+func TestRefusalDefersWhenTheExecutorIsWaitingForAHeader(t *testing.T) {
+	root := bytes.Repeat([]byte{1}, 32)
+	st := progressState(3)
+	pending := fmt.Errorf("challenge-receipt: %w", types.ErrHeaderPending)
+	for _, cold := range []bool{false, true} {
+		peer := &progressPeer{
+			heads: []struct {
+				nonce uint64
+				root  []byte
+				err   error
+			}{{nonce: 1, root: root}},
+			steps: []struct {
+				receipt []byte
+				mempool []*types.DevshardTx
+				err     error
+			}{{err: pending}},
+		}
+		if cold {
+			peer.heads[0].nonce, peer.heads[0].root, peer.heads[0].err = 0, nil, errors.New("session not found")
+		}
+		accept, err := runProgress(t, st, peer, &progressJournal{diffs: progressDiffs(3, root)}, newEvidenceGroup(t).sm)
+		require.ErrorIs(t, err, types.ErrHeaderPending, "an executor that answered and is waiting for a block gives no vote yet")
+		require.False(t, accept)
+	}
+}

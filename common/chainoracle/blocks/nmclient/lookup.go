@@ -96,6 +96,8 @@ func mapHeaderErr(err error) error {
 	switch st.Code() {
 	case codes.Unimplemented:
 		return fmt.Errorf("%w: %s", blocks.ErrHeaderRPCUnimplemented, st.Message())
+	case codes.PermissionDenied:
+		return fmt.Errorf("%w: %s", blocks.ErrHeaderUnverified, st.Message())
 	case codes.NotFound, codes.FailedPrecondition:
 		return fmt.Errorf("%w: %s", blocks.ErrHeaderNotFound, st.Message())
 	default:

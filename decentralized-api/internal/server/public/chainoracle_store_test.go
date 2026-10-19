@@ -48,10 +48,46 @@ func TestChainOracleHeaderStoreRoundTripsOnSQLite(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, ok)
 	require.NoError(t, store.SaveTrust(ctx, observer.TrustPoint{Height: 12, Hash: []byte{0x0c}}))
-	require.NoError(t, store.SaveTrust(ctx, observer.TrustPoint{Height: 13, Hash: []byte{0x0d}}))
+	require.NoError(t, store.SaveTrust(ctx, observer.TrustPoint{Height: 13, Hash: []byte{0x0d}, Epoch: 2}))
 	tp, ok, err := store.LoadTrust(ctx)
 	require.NoError(t, err)
 	require.True(t, ok)
 	require.Equal(t, int64(13), tp.Height)
 	require.Equal(t, []byte{0x0d}, tp.Hash)
+	require.Equal(t, int64(2), tp.Epoch)
+
+	require.NoError(t, store.SaveTrust(ctx, observer.TrustPoint{Hash: []byte{}, Epoch: 3}))
+	tp, ok, err = store.LoadTrust(ctx)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Zero(t, tp.Height, "a reset keeps only the new epoch")
+	require.Equal(t, int64(3), tp.Epoch)
+
+	require.NoError(t, store.SaveHeaders(ctx, []observer.StoredHeader{{Height: 20, Hash: []byte{0x14}, TimeMs: 2000, Verified: true, Epoch: 3}}))
+	got, err = store.LoadHeaders(ctx, 20)
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	require.Equal(t, int64(3), got[0].Epoch)
+}
+
+func TestChainOracleHeaderStoreNeverDowngradesAVerifiedRow(t *testing.T) {
+	db, err := apiconfig.OpenSQLite(apiconfig.SqliteConfig{Path: filepath.Join(t.TempDir(), "dapi.db")})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	ctx := context.Background()
+	store, err := observer.NewSQLiteHeaderStore(ctx, db)
+	require.NoError(t, err)
+
+	require.NoError(t, store.SaveHeaders(ctx, []observer.StoredHeader{{Height: 5, Hash: []byte{0x05}, TimeMs: 500, Verified: true}}))
+	require.NoError(t, store.SaveHeaders(ctx, []observer.StoredHeader{{Height: 5, Hash: []byte{0x05}, TimeMs: 999}}))
+	require.NoError(t, store.SaveHeaders(ctx, []observer.StoredHeader{{Height: 6, Hash: []byte{0x06}, TimeMs: 600}}))
+	require.NoError(t, store.SaveHeaders(ctx, []observer.StoredHeader{{Height: 6, Hash: []byte{0x06}, TimeMs: 601, Verified: true}}))
+
+	got, err := store.LoadHeaders(ctx, 0)
+	require.NoError(t, err)
+	require.Len(t, got, 2)
+	require.True(t, got[0].Verified)
+	require.Equal(t, int64(500), got[0].TimeMs, "an unverified write cannot replace a verified time")
+	require.True(t, got[1].Verified)
+	require.Equal(t, int64(601), got[1].TimeMs, "a verified write upgrades an unverified row")
 }

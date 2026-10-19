@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"common/chainoracle/blocks"
@@ -23,7 +24,7 @@ const (
 )
 
 var (
-	ErrUnverifiedHeader = errors.New("observer: header failed light verification")
+	ErrUnverifiedHeader = blocks.ErrHeaderUnverified
 	errBelowTrusted     = errors.New("observer: height is below the trusted header")
 )
 
@@ -35,6 +36,7 @@ type lightRPC interface {
 type TrustPoint struct {
 	Height int64
 	Hash   []byte
+	Epoch  int64
 }
 
 type lightVerifier struct {
@@ -43,6 +45,12 @@ type lightVerifier struct {
 	maxClockDrift  time.Duration
 	now            func() time.Time
 	saveTrust      func(TrustPoint)
+	loadTrust      func(context.Context) (TrustPoint, bool, error)
+	storeTrust     func(context.Context, TrustPoint) error
+	onEpoch        func(int64)
+	resetTrust     bool
+	trustLoaded    bool
+	epoch          atomic.Int64
 
 	mu          sync.Mutex
 	trusted     *cmttypes.SignedHeader
@@ -60,13 +68,6 @@ func newLightVerifier(rpc lightRPC, trustingPeriod time.Duration) *lightVerifier
 		maxClockDrift:  DefaultMaxClockDrift,
 		now:            time.Now,
 	}
-}
-
-func (v *lightVerifier) pin(tp TrustPoint) {
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	cp := TrustPoint{Height: tp.Height, Hash: append([]byte(nil), tp.Hash...)}
-	v.pinned = &cp
 }
 
 func (v *lightVerifier) trustedHeight() int64 {
@@ -135,11 +136,60 @@ func (v *lightVerifier) selfVerified(ctx context.Context, height *int64) (*cmtty
 	return sh, vals, nil
 }
 
+func (v *lightVerifier) prepareTrust(ctx context.Context) error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.loadTrustLocked(ctx)
+}
+
+func (v *lightVerifier) loadTrustLocked(ctx context.Context) error {
+	if v.trustLoaded {
+		return nil
+	}
+	var tp TrustPoint
+	ok := false
+	if v.loadTrust != nil {
+		var err error
+		if tp, ok, err = v.loadTrust(ctx); err != nil {
+			return fmt.Errorf("observer: read trust point: %w", err)
+		}
+	}
+	epoch := tp.Epoch
+	if v.resetTrust {
+		epoch++
+		if v.storeTrust != nil {
+			if err := v.storeTrust(ctx, TrustPoint{Hash: []byte{}, Epoch: epoch}); err != nil {
+				return fmt.Errorf("observer: reset trust point: %w", err)
+			}
+		}
+		ok = false
+	}
+	if ok && tp.Height > 0 && len(tp.Hash) > 0 {
+		cp := TrustPoint{Height: tp.Height, Hash: append([]byte(nil), tp.Hash...), Epoch: epoch}
+		v.pinned = &cp
+	}
+	v.epoch.Store(epoch)
+	v.trustLoaded = true
+	if v.onEpoch != nil {
+		v.onEpoch(epoch)
+	}
+	return nil
+}
+
 func (v *lightVerifier) bootstrapLocked(ctx context.Context) error {
+	if err := v.loadTrustLocked(ctx); err != nil {
+		return err
+	}
 	if v.pinned != nil {
 		h := v.pinned.Height
 		sh, vals, err := v.selfVerified(ctx, &h)
-		if err == nil && bytes.Equal(sh.Hash(), v.pinned.Hash) && !light.HeaderExpired(sh, v.trustingPeriod, v.now()) {
+		if err != nil {
+			return fmt.Errorf("observer: trust point %d is not available: %w", h, err)
+		}
+		if !bytes.Equal(sh.Hash(), v.pinned.Hash) {
+			return fmt.Errorf("%w: the node's block %d does not match the trust point", ErrUnverifiedHeader, h)
+		}
+		if !light.HeaderExpired(sh, v.trustingPeriod, v.now()) {
 			v.trusted, v.trustedVals = sh, vals
 			return nil
 		}
@@ -156,7 +206,7 @@ func (v *lightVerifier) bootstrapLocked(ctx context.Context) error {
 
 func (v *lightVerifier) persistLocked() {
 	if v.saveTrust != nil && v.trusted != nil {
-		v.saveTrust(TrustPoint{Height: v.trusted.Height, Hash: v.trusted.Hash().Bytes()})
+		v.saveTrust(TrustPoint{Height: v.trusted.Height, Hash: v.trusted.Hash().Bytes(), Epoch: v.epoch.Load()})
 	}
 }
 

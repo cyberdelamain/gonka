@@ -3,6 +3,7 @@ package nmrpc
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -142,4 +143,10 @@ func TestGetBlockHeaderWaitsWhenAsked(t *testing.T) {
 	_, err = GetBlockHeader(context.Background(), o, &gen.GetBlockHeaderRequest{Height: 9})
 	require.Equal(t, codes.NotFound, status.Code(err), "without wait_ms the plain At answers")
 	require.Zero(t, o.waited)
+}
+
+func TestGetBlockHeaderKeepsAVerificationRejectionDistinct(t *testing.T) {
+	o := stubOracle{atErr: fmt.Errorf("%w: height 9", blocks.ErrHeaderUnverified)}
+	_, err := GetBlockHeader(context.Background(), o, &gen.GetBlockHeaderRequest{Height: 9})
+	require.Equal(t, codes.PermissionDenied, status.Code(err))
 }

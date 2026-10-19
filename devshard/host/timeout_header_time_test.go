@@ -178,3 +178,95 @@ func TestApplyWaitsForAFloorBlockTheLocalChainIsAboutToSee(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, time.Unix(1_800_000_000, 0).UnixMilli(), rec.StartedAtTimeMs)
 }
+
+func TestExecutionVoteDefersOnAFinishWhoseBlockIsAboutToLand(t *testing.T) {
+	hosts := []*signing.Secp256k1Signer{testutil.MustGenerateKey(t), testutil.MustGenerateKey(t), testutil.MustGenerateKey(t)}
+	user := testutil.MustGenerateKey(t)
+	group := testutil.MakeGroup(hosts)
+	config := testutil.DefaultConfig(len(hosts))
+	config.ExecutionTimeout = 1
+	anchorAt := time.Unix(1_800_000_000, 0)
+	hash, floorHash := []byte{0xaa}, []byte{0xbb}
+	chain := newHeaderChain()
+	chain.add(100, hash, anchorAt)
+	chain.add(200, floorHash, anchorAt.Add(time.Hour))
+	sm, err := state.NewStateMachine("escrow-1", config, group, 1_000_000, user.Address(), signing.NewSecp256k1Verifier(),
+		testutil.MustMemoryStore(t, "escrow-1", user.Address(), config, group, 1_000_000),
+		state.WithHeaderTimes(headertime.New(chain)))
+	require.NoError(t, err)
+	h, err := NewHost(sm, hosts[0], stub.NewInferenceEngine(), "escrow-1", group, nil, WithChainOracle(chain))
+	require.NoError(t, err)
+
+	heartbeat := &types.DevshardTx{Tx: &types.DevshardTx_Heartbeat{Heartbeat: &types.MsgHeartbeat{
+		SlotsNum: uint64(len(hosts)), Reason: string(heightsync.ReasonQuietSession),
+	}}}
+	ack := func(ref, height uint64, blockHash []byte) *types.DevshardTx {
+		msg := &types.MsgHeightAck{RefNonce: ref, SlotId: 2, ObservedHeight: height, ObservedBlockHash: blockHash,
+			SyncState: types.SyncState_SYNCED, PeerSeen: []byte{0xff}}
+		require.NoError(t, heightsync.SignAck(hosts[2], msg))
+		return &types.DevshardTx{Tx: &types.DevshardTx_HeightAck{HeightAck: msg}}
+	}
+	const id uint64 = 4
+	start := testutil.StartTx(id)
+	start.GetStartInference().ObservedHeight = 100
+	start.GetStartInference().ObservedBlockHash = hash
+	receipt := testutil.SignExecutorReceipt(t, hosts[1], "escrow-1", id, testutil.TestPromptHash[:], "llama", 100, testutil.TestMaxTokens,
+		testutil.ReceiptStamp{Height: 100, Hash: hash})
+	confirm := &types.DevshardTx{Tx: &types.DevshardTx_ConfirmStart{ConfirmStart: &types.MsgConfirmStart{
+		InferenceId: id, ExecutorSig: receipt, ObservedHeight: 100, ObservedBlockHash: hash,
+	}}}
+	for n, txs := range [][]*types.DevshardTx{{heartbeat}, {ack(1, 100, hash)}, {heartbeat}, {start}, {confirm}, {heartbeat}, {ack(6, 200, floorHash)}} {
+		_, err := sm.ApplyDiff(testutil.SignDiff(t, user, "escrow-1", uint64(n+1), txs))
+		require.NoError(t, err)
+	}
+	require.NoError(t, h.TimeoutDue(id, types.TimeoutReason_TIMEOUT_REASON_EXECUTION))
+	st, rec, ok := sm.SnapshotWithInference(id)
+	require.True(t, ok)
+
+	finishAt := func(height uint64, blockHash []byte) []*types.DevshardTx {
+		msg := &types.MsgFinishInference{
+			InferenceId: id, ResponseHash: testutil.TestResponseHash, ServedHash: testutil.TestServedHash,
+			InputTokens: 10, OutputTokens: 20, ExecutorSlot: rec.ExecutorSlot, EscrowId: "escrow-1",
+			ObservedHeight: height, ObservedBlockHash: blockHash,
+		}
+		msg.ProposerSig = testutil.SignProposerTx(t, hosts[rec.ExecutorSlot], msg)
+		return []*types.DevshardTx{{Tx: &types.DevshardTx_FinishInference{FinishInference: msg}}}
+	}
+
+	nearHash := []byte{0xcc}
+	accept, err := VerifyExecutionTimeout(context.Background(), st, id, rec, finishAt(201, nearHash), nil, nil, h)
+	require.ErrorIs(t, err, types.ErrHeaderPending, "a Finish one block past our tip defers the vote")
+	require.False(t, accept)
+
+	accept, err = VerifyExecutionTimeout(context.Background(), st, id, rec, finishAt(1_000_000, []byte{0xdd}), nil, nil, h)
+	require.NoError(t, err)
+	require.True(t, accept, "a height far past our tip is not evidence and cannot stall the timeout")
+
+	later := time.Now().Add(PendingEvidenceDeferWindow + time.Second)
+	h.evidenceDeferrals.clock = func() time.Time { return later }
+	accept, err = VerifyExecutionTimeout(context.Background(), st, id, rec, finishAt(202, []byte{0xce}), nil, nil, h)
+	require.NoError(t, err)
+	require.True(t, accept, "after the window a new near-tip stamp no longer defers the vote")
+	h.evidenceDeferrals.clock = nil
+
+	chain.add(201, nearHash, anchorAt.Add(time.Hour+5*time.Second))
+	accept, err = VerifyExecutionTimeout(context.Background(), st, id, rec, finishAt(201, nearHash), nil, nil, h)
+	require.NoError(t, err)
+	require.False(t, accept, "once the block lands the Finish rejects the timeout")
+}
+
+func TestMovingFutureStampsCannotDeferAVoteForever(t *testing.T) {
+	var d evidenceDeferrals
+	now := time.Unix(1_800_000_000, 0)
+	d.clock = func() time.Time { return now }
+	require.True(t, d.allow(4))
+	for i := 0; i < 20; i++ {
+		now = now.Add(5 * time.Second)
+		if now.Sub(time.Unix(1_800_000_000, 0)) <= PendingEvidenceDeferWindow {
+			require.True(t, d.allow(4))
+		} else {
+			require.False(t, d.allow(4), "a re-signed stamp does not renew the window")
+		}
+	}
+	require.True(t, d.allow(5), "another inference has its own window")
+}

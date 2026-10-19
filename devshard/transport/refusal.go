@@ -209,7 +209,7 @@ func executorUnreachable(err error) bool {
 	if err == nil {
 		return false
 	}
-	if IsStorageBusy(err) {
+	if IsStorageBusy(err) || IsHeaderPending(err) {
 		return false
 	}
 	if errors.Is(err, ErrPeerNotReady) {
