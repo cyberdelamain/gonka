@@ -2,6 +2,8 @@ package state
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"math"
 	"time"
@@ -72,6 +74,13 @@ func (sm *StateMachine) floorTimeMsLocked(p heightsync.FloorPoint) (int64, error
 		return 0, fmt.Errorf("%w: no header time source for height %d", types.ErrHeaderPending, p.Height)
 	}
 	ms, err := sm.headerTimes.HeaderTimeMs(p.Height, p.Hash)
+	if errors.Is(err, types.ErrHeaderPending) && sm.replayingPersisted {
+		if awaiter, ok := sm.headerTimes.(HeaderTimeAwaiter); ok {
+			ctx, cancel := context.WithTimeout(context.Background(), ReplayHeaderAwait)
+			ms, err = awaiter.AwaitHeaderTimeMs(ctx, p.Height, p.Hash)
+			cancel()
+		}
+	}
 	if err != nil {
 		return 0, err
 	}
@@ -141,6 +150,10 @@ func (sm *StateMachine) timeoutRemainingLocked(rec *types.InferenceRecord, reaso
 	elapsed := nowMs - anchorMs
 	if elapsed >= windowMs {
 		return 0, nil
+	}
+	maxRemainingMs := int64(time.Duration(math.MaxInt64) / time.Millisecond)
+	if elapsed < windowMs-maxRemainingMs {
+		return time.Duration(math.MaxInt64), nil
 	}
 	return time.Duration(windowMs-elapsed) * time.Millisecond, nil
 }

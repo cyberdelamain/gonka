@@ -2,6 +2,7 @@ package host
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -109,7 +110,7 @@ func TestTimeoutVoteNeedsTheFloorBlockOnTheLocalChain(t *testing.T) {
 			confirm := &types.DevshardTx{Tx: &types.DevshardTx_ConfirmStart{ConfirmStart: &types.MsgConfirmStart{
 				InferenceId: id, ExecutorSig: receipt, ObservedHeight: 100, ObservedBlockHash: hash,
 			}}}
-			for n, txs := range [][]*types.DevshardTx{{heartbeat}, {ack(1, 100, hash)}, {heartbeat}, {start}, {confirm}, {heartbeat}, {ack(6, 1_000_000, farHash)}} {
+			for n, txs := range [][]*types.DevshardTx{{heartbeat}, {ack(1, 100, hash)}, {heartbeat}, {start}, {confirm}, {heartbeat}} {
 				_, err := sm.ApplyDiff(testutil.SignDiff(t, user, "escrow-1", uint64(n+1), txs))
 				require.NoError(t, err)
 			}
@@ -121,13 +122,18 @@ func TestTimeoutVoteNeedsTheFloorBlockOnTheLocalChain(t *testing.T) {
 			if tc.chainHash != nil {
 				chain.add(1_000_000, tc.chainHash, anchorAt.Add(time.Hour))
 			}
-			require.ErrorIs(t, h.TimeoutDue(id, types.TimeoutReason_TIMEOUT_REASON_EXECUTION), tc.wantErr,
-				"a floor height the local chain cannot prove gives no block time to count")
+			_, err = sm.ApplyDiff(testutil.SignDiff(t, user, "escrow-1", 7, []*types.DevshardTx{ack(6, 1_000_000, farHash)}))
+			require.ErrorIs(t, err, tc.wantErr)
+			floor, _, _ := sm.HeightSyncFloorAsOf(7)
+			require.EqualValues(t, 100, floor)
+			require.ErrorIs(t, h.TimeoutDue(id, types.TimeoutReason_TIMEOUT_REASON_EXECUTION), types.ErrTimeoutNotDue)
 
 			if tc.chainHash != nil {
 				return
 			}
 			chain.add(1_000_000, farHash, anchorAt.Add(500*time.Millisecond))
+			_, err = sm.ApplyDiff(testutil.SignDiff(t, user, "escrow-1", 7, []*types.DevshardTx{ack(6, 1_000_000, farHash)}))
+			require.NoError(t, err)
 			require.ErrorIs(t, h.TimeoutDue(id, types.TimeoutReason_TIMEOUT_REASON_EXECUTION), types.ErrTimeoutNotDue,
 				"the window is block time, not the distance in heights")
 		})
@@ -269,4 +275,35 @@ func TestMovingFutureStampsCannotDeferAVoteForever(t *testing.T) {
 		}
 	}
 	require.True(t, d.allow(5), "another inference has its own window")
+}
+
+type pendingExecutor struct{ calls int }
+
+func (p *pendingExecutor) GetMempool(context.Context) ([]*types.DevshardTx, error) { return nil, nil }
+
+func (p *pendingExecutor) ChallengeCatchUp(context.Context, uint64, []types.DiffWire, string) error {
+	return fmt.Errorf("challenge-receipt: %w", types.ErrHeaderPending)
+}
+
+func (p *pendingExecutor) ChallengeReceipt(context.Context, uint64, *InferencePayload, []types.Diff) ([]byte, []*types.DevshardTx, error) {
+	p.calls++
+	return nil, nil, fmt.Errorf("challenge-receipt: %w", types.ErrHeaderPending)
+}
+
+func TestExecutorHeaderPendingCannotHoldAnExecutionTimeoutForever(t *testing.T) {
+	st := stateWithStarted(1, 1)
+	now := time.Unix(1_800_000_000, 0)
+	judge := windowedJudge{EvidenceVerifier: due(newEvidenceGroup(t).sm), deferrals: &evidenceDeferrals{clock: func() time.Time { return now }}}
+	executor := &pendingExecutor{}
+
+	for round := 0; round < 5; round++ {
+		accept, err := VerifyExecutionTimeout(context.Background(), st, 1, st.Inferences[1], nil, executor, nil, judge)
+		require.ErrorIs(t, err, types.ErrHeaderPending, "inside the window the executor's wait defers the vote")
+		require.False(t, accept)
+		now = now.Add(10 * time.Second)
+	}
+	now = now.Add(PendingEvidenceDeferWindow)
+	accept, err := VerifyExecutionTimeout(context.Background(), st, 1, st.Inferences[1], nil, executor, nil, judge)
+	require.NoError(t, err)
+	require.True(t, accept, "after the window the unverifiable answer counts as unreachable, as before")
 }

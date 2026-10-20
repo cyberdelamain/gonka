@@ -70,6 +70,10 @@ func (c *signedChain) grow(tip int64) {
 }
 
 func (c *signedChain) sign(height int64, last cmttypes.BlockID, vals *cmttypes.ValidatorSet, privs []cmttypes.PrivValidator) *cmttypes.SignedHeader {
+	return c.signWithNext(height, last, vals, privs, vals)
+}
+
+func (c *signedChain) signWithNext(height int64, last cmttypes.BlockID, vals *cmttypes.ValidatorSet, privs []cmttypes.PrivValidator, next *cmttypes.ValidatorSet) *cmttypes.SignedHeader {
 	hdr := &cmttypes.Header{
 		Version:            cmtversion.Consensus{Block: version.BlockProtocol},
 		ChainID:            signedChainID,
@@ -79,7 +83,7 @@ func (c *signedChain) sign(height int64, last cmttypes.BlockID, vals *cmttypes.V
 		LastCommitHash:     tmhash.Sum([]byte("last-commit")),
 		DataHash:           tmhash.Sum([]byte("data")),
 		ValidatorsHash:     vals.Hash(),
-		NextValidatorsHash: vals.Hash(),
+		NextValidatorsHash: next.Hash(),
 		ConsensusHash:      tmhash.Sum([]byte("consensus")),
 		AppHash:            tmhash.Sum([]byte("app")),
 		LastResultsHash:    tmhash.Sum([]byte("results")),
@@ -530,4 +534,35 @@ func TestTrustResetDoesNotServeHeadersFromTheOldRoot(t *testing.T) {
 	h, err = again.At(context.Background(), 60)
 	require.NoError(t, err)
 	require.Equal(t, second.headers[60].Hash().Bytes(), h.BlockHash, "the next restart keeps the new epoch")
+}
+
+func TestVerifiedAtFollowsIntermediateHeadersAcrossValidatorRotation(t *testing.T) {
+	for _, valid := range []bool{true, false} {
+		name := "valid transition"
+		if !valid {
+			name = "uncommitted transition"
+		}
+		t.Run(name, func(t *testing.T) {
+			c := newSignedChain(t, 1)
+			nextVals, nextPrivs := cmttypes.RandValidatorSet(4, 10)
+			if valid {
+				c.headers[1] = c.signWithNext(1, cmttypes.BlockID{}, c.vals, c.privs, nextVals)
+			}
+			o := verifyingOracle(c, nil)
+			_, err := o.At(context.Background(), 1)
+			require.NoError(t, err)
+			c.vals, c.privs = nextVals, nextPrivs
+			c.grow(5)
+			header, err := o.At(context.Background(), 5)
+			if !valid {
+				require.ErrorIs(t, err, blocks.ErrHeaderUnverified)
+				require.Nil(t, header)
+				require.EqualValues(t, 1, o.verifier.trustedHeight())
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, c.headers[5].Hash().Bytes(), header.BlockHash)
+			require.EqualValues(t, 5, o.verifier.trustedHeight())
+		})
+	}
 }

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"maps"
+	"math"
 	"slices"
 
 	"devshard/heightsync"
@@ -47,6 +48,9 @@ func FinishedClockRequiredSeconds(graceSeconds, executionTimeout int64) int64 {
 	}
 	if executionTimeout < 0 {
 		executionTimeout = 0
+	}
+	if graceSeconds > math.MaxInt64-executionTimeout {
+		return math.MaxInt64
 	}
 	return graceSeconds + executionTimeout
 }

@@ -854,6 +854,9 @@ func (sm *StateMachine) applyCoreJournaled(nonce uint64, txs []*types.DevshardTx
 
 	// 4. Apply each tx.
 	for _, tx := range txs {
+		if err := sm.checkRaiseResolvableLocked(nonce, tx); err != nil {
+			return nil, nil, err
+		}
 		if err := sm.applyTx(tx, nonce); err != nil {
 			return nil, nil, err
 		}

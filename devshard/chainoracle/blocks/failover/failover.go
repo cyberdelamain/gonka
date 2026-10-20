@@ -440,7 +440,10 @@ func (o *Oracle) HeaderAtWait(ctx context.Context, height int64, wait time.Durat
 		return blocks.DummyHeader(height), nil
 	}
 	now := o.now()
-	if blocked, _ := o.nmBlocked(now); !blocked {
+	o.mu.Lock()
+	skipNM := o.nm == nil || o.nmUnimpl && now.Before(o.nmNextTry)
+	o.mu.Unlock()
+	if !skipNM {
 		var h *blocks.Header
 		var err error
 		if w, ok := o.nm.(blocks.HeaderWaiter); ok && wait > 0 {

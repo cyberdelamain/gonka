@@ -3,6 +3,7 @@ package state
 import (
 	"context"
 	"fmt"
+	"math"
 	"sync"
 	"testing"
 	"time"
@@ -95,7 +96,9 @@ func TestMissingHeaderBlocksTheTimeoutInsteadOfGuessing(t *testing.T) {
 	d.raise(100, hash)
 	id := d.next()
 	require.NoError(t, d.start(id, 100, hash))
+	src.set(1_000_000, time.Hour+time.Duration(d.sm.Config().RefusalTimeout)*time.Second)
 	d.raise(1_000_000, []byte{0x0f, 0x00})
+	src.set(1_000_000, 0)
 
 	before, err := d.sm.ComputeStateRoot()
 	require.NoError(t, err)
@@ -118,7 +121,9 @@ func TestSettlementWaitsForTheDrainFloorHeader(t *testing.T) {
 	d.raise(100, hash)
 	id := d.next()
 	require.NoError(t, d.start(id, 100, hash))
+	src.set(200, 2*time.Hour)
 	d.raise(200, []byte{0x02, 0x00})
+	src.set(200, 0)
 
 	sealNonce := d.next()
 	d.sm.mu.Lock()
@@ -177,7 +182,9 @@ func TestReplayWaitsForAHeaderInsteadOfFailingRecovery(t *testing.T) {
 	hash := []byte{0x01, 0x00}
 	src.set(100, time.Hour)
 	d.raise(100, hash)
+	src.set(200, 2*time.Hour)
 	d.raise(200, []byte{0x02, 0x00})
+	src.set(200, 0)
 	nonce := d.next()
 	start := divStartTx(nonce, 200, []byte{0x02, 0x00})
 
@@ -202,7 +209,9 @@ func TestReplayGivesUpOnAHeaderThatNeverArrives(t *testing.T) {
 	d, src := newHeaderTimeDriver(t)
 	src.set(100, time.Hour)
 	d.raise(100, []byte{0x01, 0x00})
+	src.set(200, 2*time.Hour)
 	d.raise(200, []byte{0x02, 0x00})
+	src.set(200, 0)
 	nonce := d.next()
 	start := divStartTx(nonce, 200, []byte{0x02, 0x00})
 	err := RetryWhileHeaderPending(context.Background(), 1500*time.Millisecond, func() error {
@@ -268,4 +277,91 @@ func TestComposeKeepsAFinishWhoseHeaderIsOnlyLate(t *testing.T) {
 	require.Empty(t, deferred)
 	rec, _ := d.sm.GetInference(id)
 	require.Equal(t, types.StatusFinished, rec.Status)
+}
+
+func TestApplyPathsWaitBeforeInstallingAnUnresolvableFloorRaise(t *testing.T) {
+	for _, path := range []string{"ApplyDiff", "ValidateDiff", "ApplyLocal", "ApplyLocalPersisted"} {
+		t.Run(path, func(t *testing.T) {
+			d, src, id := startedUnderHeaderTimes(t)
+			finish := d.stampedFinish(id, 1_000_000, []byte{0x0f, 0x00})
+			nonce := d.next()
+			txs := []*types.DevshardTx{divStartTx(nonce, 100, []byte{0x01, 0x00}), finish}
+			before, err := d.sm.ComputeStateRoot()
+			require.NoError(t, err)
+			apply := func() error {
+				switch path {
+				case "ApplyDiff":
+					_, err = d.sm.ApplyDiff(testutil.SignDiff(t, d.user, "escrow-1", nonce, txs))
+				case "ValidateDiff":
+					_, err = d.sm.ValidateDiff(testutil.SignDiff(t, d.user, "escrow-1", nonce, txs))
+				case "ApplyLocal":
+					_, err = d.sm.ApplyLocal(nonce, txs)
+				case "ApplyLocalPersisted":
+					_, err = d.sm.ApplyLocalPersisted(nonce, txs)
+				}
+				return err
+			}
+			require.ErrorIs(t, apply(), types.ErrHeaderPending)
+			after, err := d.sm.ComputeStateRoot()
+			require.NoError(t, err)
+			require.Equal(t, before, after)
+			require.Equal(t, nonce-1, d.sm.LatestNonce())
+			floor, _, _ := d.sm.HeightSyncFloorAsOf(nonce)
+			require.EqualValues(t, 100, floor)
+			src.set(1_000_000, 2*time.Hour)
+			require.NoError(t, apply())
+		})
+	}
+}
+
+func TestLargeTimeoutWindowDoesNotOverflowIntoAnImmediateTimeout(t *testing.T) {
+	for _, seconds := range []int64{math.MaxInt64, math.MaxInt64/int64(time.Second) + 1} {
+		d, src := newHeaderTimeDriver(t)
+		d.sm.state.Config.RefusalTimeout = seconds
+		src.set(100, time.Hour)
+		hash := []byte{0x01, 0x00}
+		d.raise(100, hash)
+		id := d.next()
+		require.NoError(t, d.start(id, 100, hash))
+		remaining, err := d.sm.TimeoutRemaining(id, types.TimeoutReason_TIMEOUT_REASON_REFUSED)
+		require.NoError(t, err)
+		require.Positive(t, remaining)
+		require.ErrorIs(t, d.sm.TimeoutDue(id, types.TimeoutReason_TIMEOUT_REASON_REFUSED), types.ErrTimeoutNotDue)
+	}
+	require.EqualValues(t, math.MaxInt64, FinishedClockRequiredSeconds(1, math.MaxInt64))
+}
+
+type awaitingHeaderTimes struct {
+	*headerTimes
+	arrive chan struct{}
+}
+
+func (a awaitingHeaderTimes) AwaitHeaderTimeMs(ctx context.Context, height uint64, hash []byte) (int64, error) {
+	select {
+	case <-a.arrive:
+	case <-ctx.Done():
+	}
+	return a.HeaderTimeMs(height, hash)
+}
+
+func TestPersistedReplayAwaitsTheHeaderInOneApply(t *testing.T) {
+	d, src := newHeaderTimeDriver(t)
+	src.set(100, time.Hour)
+	d.raise(100, []byte{0x01, 0x00})
+	arrive := make(chan struct{})
+	d.sm.headerTimes = awaitingHeaderTimes{headerTimes: src, arrive: arrive}
+
+	d.turn++
+	ref := d.next()
+	require.NoError(t, d.apply(divHeartbeatTx(0, nil)))
+	ack := divAckTx(t, d.hosts[1], d.turn, ref, 1, 300, []byte{0x03, 0x00}, types.SyncState_SYNCED)
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		src.set(300, 2*time.Hour)
+		close(arrive)
+	}()
+	_, err := d.sm.ApplyLocalPersisted(d.next(), []*types.DevshardTx{ack})
+	require.NoError(t, err, "replay waits for the raise's header instead of failing the apply")
+	h, _, _ := d.sm.HeightSyncFloorAsOf(d.next())
+	require.Equal(t, uint64(300), h)
 }

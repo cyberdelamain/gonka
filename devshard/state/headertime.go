@@ -46,6 +46,7 @@ func SetFallbackHeaderTimes(src HeaderTimeSource) {
 const (
 	HeaderPendingRetryInterval = time.Second
 	ReplayHeaderWait           = 2 * time.Minute
+	ReplayHeaderAwait          = 10 * time.Second
 )
 
 func RetryWhileHeaderPending(ctx context.Context, maxWait time.Duration, apply func() error) error {

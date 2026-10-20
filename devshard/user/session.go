@@ -4213,7 +4213,7 @@ func (s *Session) TimeoutDeadline(nonce uint64, sendTime time.Time) (string, tim
 		if remaining, err := s.sm.TimeoutRemaining(nonce, reason); err == nil {
 			deadline = time.Now()
 			if remaining > 0 {
-				deadline = deadline.Add(remaining + TimeoutBuffer)
+				deadline = deadline.Add(remaining).Add(TimeoutBuffer)
 			}
 		}
 	}

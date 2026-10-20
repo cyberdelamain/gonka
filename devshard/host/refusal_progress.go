@@ -316,7 +316,7 @@ func challengeAndMaybeRetry(
 	unreachable func(error) bool,
 ) (bool, error) {
 	outcome, err := challengeOnce(ctx, st, inferenceID, rec, payload, cursor, executorClient, ingest, ev, tip, journal, queryTimeout, unreachable)
-	accept, done, err := classifyChallenge(outcome, err, unreachable)
+	accept, done, err := classifyChallenge(outcome, err, unreachable, func() bool { return headerPendingDefers(ev, inferenceID) })
 	if done {
 		return accept, err
 	}
@@ -328,14 +328,17 @@ func challengeAndMaybeRetry(
 
 // classifyChallenge turns a challengeFrom result into an accept decision.
 // done is false when the caller may retry a matching root.
-func classifyChallenge(outcome refusedChallenge, err error, unreachable func(error) bool) (accept bool, done bool, ret error) {
+func classifyChallenge(outcome refusedChallenge, err error, unreachable func(error) bool, deferPending func() bool) (accept bool, done bool, ret error) {
 	if err != nil {
 		var call *executorCallError
 		if !errors.As(err, &call) {
 			return false, true, err
 		}
 		if errors.Is(call.err, types.ErrHeaderPending) {
-			return false, true, call.err
+			if deferPending() {
+				return false, true, call.err
+			}
+			return true, true, nil
 		}
 		if unreachable(call.err) {
 			return true, true, nil
@@ -396,7 +399,7 @@ func refusalAfterProgress(
 			return true, nil
 		}
 		outcome, err := challengeOnce(ctx, st, inferenceID, rec, payload, nonce+1, executorClient, ingest, ev, tip, journal, queryTimeout, unreachable)
-		accept, done, err := classifyChallenge(outcome, err, unreachable)
+		accept, done, err := classifyChallenge(outcome, err, unreachable, func() bool { return headerPendingDefers(ev, inferenceID) })
 		if !done {
 			previous = nonce
 			continue

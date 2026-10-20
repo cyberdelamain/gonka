@@ -681,3 +681,21 @@ func TestHeaderAtWaitIgnoresTransportWordsInARejection(t *testing.T) {
 	require.Error(t, err, "a plain error is not a gRPC transport status")
 	require.Zero(t, chain.calls.Load())
 }
+
+func TestHeaderAtWaitDoesNotInheritLatestBackoff(t *testing.T) {
+	for _, latestErr := range []error{blocks.ErrHeaderNotFound, blocks.ErrHeaderUnverified, status.Error(codes.Internal, "observer failure")} {
+		t.Run(latestErr.Error(), func(t *testing.T) {
+			nm := &recOracle{err: latestErr}
+			chain := &recOracle{hdr: nmHdr()}
+			o := failover.New(nil, nm, chain)
+			_, err := o.Latest(context.Background())
+			require.NoError(t, err)
+			nm.err = blocks.ErrHeaderUnverified
+			calls := nm.calls.Load()
+			_, err = o.HeaderAtWait(context.Background(), 7, time.Second)
+			require.ErrorIs(t, err, blocks.ErrHeaderUnverified)
+			require.Equal(t, calls+1, nm.calls.Load())
+			require.EqualValues(t, 1, chain.calls.Load())
+		})
+	}
+}

@@ -3,6 +3,7 @@ package public
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"os"
 	"strings"
 	"time"
@@ -37,10 +38,9 @@ func NewChainOracle(rpcURL string, db *sql.DB) (*observer.Oracle, error) {
 	if db != nil {
 		store, err := observer.NewSQLiteHeaderStore(context.Background(), db)
 		if err != nil {
-			logging.Warn("chainoracle header store unavailable", types.Server, "error", err)
-		} else {
-			cfg.Store = store
+			return nil, fmt.Errorf("chainoracle header store unavailable: %w", err)
 		}
+		cfg.Store = store
 	}
 	o, err := observer.NewTendermint(cfg)
 	if err != nil {

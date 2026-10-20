@@ -91,3 +91,17 @@ func TestChainOracleHeaderStoreNeverDowngradesAVerifiedRow(t *testing.T) {
 	require.True(t, got[1].Verified)
 	require.Equal(t, int64(601), got[1].TimeMs, "a verified write upgrades an unverified row")
 }
+
+func TestChainOracleStoreInitializationFailureBlocksBootstrap(t *testing.T) {
+	t.Setenv("DAPI_CHAINORACLE_DISABLED", "false")
+	t.Setenv("DAPI_CHAINORACLE_VERIFY_COMMITS", "true")
+	db, err := apiconfig.OpenSQLite(apiconfig.SqliteConfig{Path: filepath.Join(t.TempDir(), "dapi.db")})
+	require.NoError(t, err)
+	store, err := observer.NewSQLiteHeaderStore(context.Background(), db)
+	require.NoError(t, err)
+	require.NoError(t, store.SaveTrust(context.Background(), observer.TrustPoint{Height: 7, Hash: []byte{7}}))
+	require.NoError(t, db.Close())
+	oracle, err := NewChainOracle("http://127.0.0.1:1", db)
+	require.ErrorContains(t, err, "chainoracle header store unavailable")
+	require.Nil(t, oracle)
+}

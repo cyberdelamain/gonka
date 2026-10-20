@@ -3,6 +3,7 @@ package state
 import (
 	"math"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -50,6 +51,10 @@ func fourHosts(t *testing.T) []*signing.Secp256k1Signer {
 func TestHeightSyncFloor_HostClaimSetsLogicalTimeAtAnyDistance(t *testing.T) {
 	hosts := fourHosts(t)
 	sm, user := newTestSM(t, hosts, 1_000_000)
+	src := newHeaderTimes()
+	src.set(250, time.Hour)
+	src.set(math.MaxUint64/2, 2*time.Hour)
+	sm.headerTimes = src
 	apply := func(nonce uint64, txs ...*types.DevshardTx) error {
 		_, err := sm.ApplyDiff(testutil.SignDiff(t, user, "escrow-1", nonce, txs))
 		return err

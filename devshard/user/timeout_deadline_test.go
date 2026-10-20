@@ -2,6 +2,7 @@ package user
 
 import (
 	"context"
+	"math"
 	"testing"
 	"time"
 
@@ -9,6 +10,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	"devshard/host"
+	"devshard/internal/testutil"
 	"devshard/signing"
 	"devshard/types"
 )
@@ -81,4 +83,19 @@ func TestTimeoutDeadlineKeepsARecordWithoutTheStampRefused(t *testing.T) {
 
 	require.Equal(t, "refused", reason)
 	require.Equal(t, sendTime.Add(time.Duration(session.sm.Config().RefusalTimeout)*time.Second+TimeoutBuffer), deadline)
+}
+
+func TestTimeoutDeadlineDoesNotOverflowWhenRemainingDurationIsSaturated(t *testing.T) {
+	hosts := []*signing.Secp256k1Signer{testutil.MustGenerateKey(t), testutil.MustGenerateKey(t), testutil.MustGenerateKey(t)}
+	config := testutil.DefaultConfig(len(hosts))
+	config.RefusalTimeout, config.ExecutionTimeout = math.MaxInt64, math.MaxInt64
+	session, _, _ := armedSessionFor(t, testutil.MakeGroup(hosts), hosts, config, 1_000_000, 0)
+	pending := prepareNonce(t, session)
+	reason, deadline := session.TimeoutDeadline(pending, time.Now())
+	require.Equal(t, "refused", reason)
+	require.True(t, deadline.After(time.Now().Add(time.Hour)))
+	started := startedNonce(t, session, hosts, time.Now().Unix())
+	reason, deadline = session.TimeoutDeadline(started, time.Now())
+	require.Equal(t, "execution", reason)
+	require.True(t, deadline.After(time.Now().Add(time.Hour)))
 }

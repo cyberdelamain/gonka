@@ -193,8 +193,6 @@ message ListNodeCapacityResponse {
 }
 
 // GetBlockHeaderRequest looks up a committed header. Height 0 means Latest().
-// wait_ms > 0 waits up to that long (capped server-side) for a height the
-// chain has not produced yet instead of answering NotFound.
 message GetBlockHeaderRequest {
   int64 height = 1;
   int64 wait_ms = 2;

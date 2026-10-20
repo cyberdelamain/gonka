@@ -1419,8 +1419,6 @@ func (x *ListNodeCapacityResponse) GetServedAtUnix() int64 {
 }
 
 // GetBlockHeaderRequest looks up a committed header. Height 0 means Latest().
-// wait_ms > 0 waits up to that long (capped server-side) for a height the
-// chain has not produced yet instead of answering NotFound.
 type GetBlockHeaderRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Height        int64                  `protobuf:"varint,1,opt,name=height,proto3" json:"height,omitempty"`

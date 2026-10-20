@@ -115,6 +115,10 @@ func (h *Host) PendingEvidenceDeferrable(txs ...*types.DevshardTx) bool {
 	return h.evidenceDeferrals.allow(inferenceID)
 }
 
+func (h *Host) HeaderPendingDeferrable(inferenceID uint64) bool {
+	return h.evidenceDeferrals.allow(inferenceID)
+}
+
 func (h *Host) TimeoutDue(inferenceID uint64, reason types.TimeoutReason) error {
 	return h.sm.TimeoutDue(inferenceID, reason)
 }
@@ -138,6 +142,12 @@ func verifiedConfirm(ev EvidenceVerifier, inferenceID uint64, rec *types.Inferen
 
 type PendingEvidenceJudge interface {
 	PendingEvidenceDeferrable(txs ...*types.DevshardTx) bool
+	HeaderPendingDeferrable(inferenceID uint64) bool
+}
+
+func headerPendingDefers(ev EvidenceVerifier, inferenceID uint64) bool {
+	judge, ok := ev.(PendingEvidenceJudge)
+	return ok && judge.HeaderPendingDeferrable(inferenceID)
 }
 
 func evidencePending(ev EvidenceVerifier, err error, seq []*types.DevshardTx) bool {
@@ -394,11 +404,12 @@ func verifyRefusedTimeout(
 	if executorClient == nil {
 		return true, nil
 	}
-	return finishRefusedChallenge(challengeRefused(ctx, st.EscrowID, inferenceID, rec, payload, diffs, executorClient, ingest, ev))
+	outcome, callErr := challengeRefused(ctx, st.EscrowID, inferenceID, rec, payload, diffs, executorClient, ingest, ev)
+	return finishRefusedChallenge(outcome, callErr, func() bool { return headerPendingDefers(ev, inferenceID) })
 }
 
-func finishRefusedChallenge(outcome refusedChallenge, callErr error) (bool, error) {
-	if errors.Is(callErr, types.ErrHeaderPending) {
+func finishRefusedChallenge(outcome refusedChallenge, callErr error, deferPending func() bool) (bool, error) {
+	if errors.Is(callErr, types.ErrHeaderPending) && deferPending() {
 		return false, callErr
 	}
 	if callErr != nil {
@@ -506,7 +517,7 @@ func VerifyExecutionTimeout(
 	// to return, and the timeout stands.
 	if executorClient != nil {
 		_, executorMempool, err := executorClient.ChallengeReceipt(ctx, inferenceID, nil, nil)
-		if errors.Is(err, types.ErrHeaderPending) {
+		if errors.Is(err, types.ErrHeaderPending) && headerPendingDefers(ev, inferenceID) {
 			return false, err
 		}
 		if err == nil {

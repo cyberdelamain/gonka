@@ -224,6 +224,13 @@ func (v *lightVerifier) ensureTrusted(ctx context.Context) (*cmttypes.Header, er
 func (v *lightVerifier) verifyForward(ctx context.Context, height int64) (*cmttypes.Header, error) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
+	return v.verifyForwardLocked(ctx, height)
+}
+
+func (v *lightVerifier) verifyForwardLocked(ctx context.Context, height int64) (*cmttypes.Header, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if v.trusted == nil {
 		if err := v.bootstrapLocked(ctx); err != nil {
 			return nil, err
@@ -261,6 +268,14 @@ func (v *lightVerifier) verifyForward(ctx context.Context, height int64) (*cmtty
 			return nil, fmt.Errorf("%w: %d < %d", errBelowTrusted, height, v.trusted.Height)
 		}
 		err = light.Verify(v.trusted, v.trustedVals, sh, vals, v.trustingPeriod, v.now(), v.maxClockDrift, light.DefaultTrustLevel)
+	}
+	var insufficientTrust light.ErrNewValSetCantBeTrusted
+	if errors.As(err, &insufficientTrust) && height > v.trusted.Height+1 {
+		mid := v.trusted.Height + (height-v.trusted.Height)/2
+		if _, err := v.verifyForwardLocked(ctx, mid); err != nil {
+			return nil, err
+		}
+		return v.verifyForwardLocked(ctx, height)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("%w: height %d: %v", ErrUnverifiedHeader, height, err)
