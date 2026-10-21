@@ -1171,10 +1171,12 @@ type windowedJudge struct {
 	deferrals *evidenceDeferrals
 }
 
-func (w windowedJudge) PendingEvidenceDeferrable(...*types.DevshardTx) bool { return false }
+func (w windowedJudge) PendingEvidenceDeferrable(types.TimeoutReason, ...*types.DevshardTx) bool {
+	return false
+}
 
-func (w windowedJudge) HeaderPendingDeferrable(inferenceID uint64) bool {
-	return w.deferrals.allow(inferenceID)
+func (w windowedJudge) HeaderPendingDeferrable(inferenceID uint64, reason types.TimeoutReason) bool {
+	return w.deferrals.allow(inferenceID, reason)
 }
 
 func TestRefusalDefersWhenTheExecutorIsWaitingForAHeader(t *testing.T) {

@@ -63,13 +63,21 @@ const PendingEvidenceDeferWindow = 60 * time.Second
 
 const pendingEvidenceForget = time.Hour
 
+// deferralKey keeps the refusal and execution stages of one inference in
+// separate windows: a wait spent before ConfirmStart does not shorten the one
+// after it.
+type deferralKey struct {
+	inferenceID uint64
+	reason      types.TimeoutReason
+}
+
 type evidenceDeferrals struct {
 	mu    sync.Mutex
-	first map[uint64]time.Time
+	first map[deferralKey]time.Time
 	clock func() time.Time
 }
 
-func (d *evidenceDeferrals) allow(inferenceID uint64) bool {
+func (d *evidenceDeferrals) allow(inferenceID uint64, reason types.TimeoutReason) bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	now := time.Now()
@@ -77,22 +85,23 @@ func (d *evidenceDeferrals) allow(inferenceID uint64) bool {
 		now = d.clock()
 	}
 	if d.first == nil {
-		d.first = make(map[uint64]time.Time)
+		d.first = make(map[deferralKey]time.Time)
 	}
 	for id, at := range d.first {
 		if now.Sub(at) > pendingEvidenceForget {
 			delete(d.first, id)
 		}
 	}
-	at, seen := d.first[inferenceID]
+	key := deferralKey{inferenceID: inferenceID, reason: reason}
+	at, seen := d.first[key]
 	if !seen {
-		d.first[inferenceID] = now
+		d.first[key] = now
 		return true
 	}
 	return now.Sub(at) <= PendingEvidenceDeferWindow
 }
 
-func (h *Host) PendingEvidenceDeferrable(txs ...*types.DevshardTx) bool {
+func (h *Host) PendingEvidenceDeferrable(reason types.TimeoutReason, txs ...*types.DevshardTx) bool {
 	var top, inferenceID uint64
 	for _, tx := range txs {
 		if height, _, ok := heightsync.RefStamp(tx); ok && height > top {
@@ -112,11 +121,11 @@ func (h *Host) PendingEvidenceDeferrable(txs ...*types.DevshardTx) bool {
 			return false
 		}
 	}
-	return h.evidenceDeferrals.allow(inferenceID)
+	return h.evidenceDeferrals.allow(inferenceID, reason)
 }
 
-func (h *Host) HeaderPendingDeferrable(inferenceID uint64) bool {
-	return h.evidenceDeferrals.allow(inferenceID)
+func (h *Host) HeaderPendingDeferrable(inferenceID uint64, reason types.TimeoutReason) bool {
+	return h.evidenceDeferrals.allow(inferenceID, reason)
 }
 
 func (h *Host) TimeoutDue(inferenceID uint64, reason types.TimeoutReason) error {
@@ -136,33 +145,35 @@ var (
 // verifiedConfirm returns the first ConfirmStart for inferenceID in pool that
 // would apply to rec. A non-nil receipt must equal its ExecutorSig.
 func verifiedConfirm(ev EvidenceVerifier, inferenceID uint64, rec *types.InferenceRecord, receipt []byte, pool []*types.DevshardTx) *types.DevshardTx {
-	tx, _ := verifiedConfirmOrPending(ev, inferenceID, rec, receipt, pool)
+	tx, _ := verifiedConfirmOrPending(ev, inferenceID, rec, receipt, pool, types.TimeoutReason_TIMEOUT_REASON_UNSPECIFIED)
 	return tx
 }
 
 type PendingEvidenceJudge interface {
-	PendingEvidenceDeferrable(txs ...*types.DevshardTx) bool
-	HeaderPendingDeferrable(inferenceID uint64) bool
+	PendingEvidenceDeferrable(reason types.TimeoutReason, txs ...*types.DevshardTx) bool
+	HeaderPendingDeferrable(inferenceID uint64, reason types.TimeoutReason) bool
 }
 
-func headerPendingDefers(ev EvidenceVerifier, inferenceID uint64) bool {
+func headerPendingDefers(ev EvidenceVerifier, inferenceID uint64, reason types.TimeoutReason) bool {
 	judge, ok := ev.(PendingEvidenceJudge)
-	return ok && judge.HeaderPendingDeferrable(inferenceID)
+	return ok && judge.HeaderPendingDeferrable(inferenceID, reason)
 }
 
-func evidencePending(ev EvidenceVerifier, err error, seq []*types.DevshardTx) bool {
-	if !errors.Is(err, types.ErrHeaderPending) {
+// evidencePending opens or reads the deferral window of reason. UNSPECIFIED is
+// a lookup whose pending result is discarded: it does not touch the window.
+func evidencePending(ev EvidenceVerifier, err error, seq []*types.DevshardTx, reason types.TimeoutReason) bool {
+	if reason == types.TimeoutReason_TIMEOUT_REASON_UNSPECIFIED || !errors.Is(err, types.ErrHeaderPending) {
 		return false
 	}
 	judge, ok := ev.(PendingEvidenceJudge)
-	return ok && judge.PendingEvidenceDeferrable(seq...)
+	return ok && judge.PendingEvidenceDeferrable(reason, seq...)
 }
 
 func evidencePendingErr(inferenceID uint64) error {
 	return fmt.Errorf("%w: evidence for inference %d waits for a block header", types.ErrHeaderPending, inferenceID)
 }
 
-func verifiedConfirmOrPending(ev EvidenceVerifier, inferenceID uint64, rec *types.InferenceRecord, receipt []byte, pool []*types.DevshardTx) (*types.DevshardTx, bool) {
+func verifiedConfirmOrPending(ev EvidenceVerifier, inferenceID uint64, rec *types.InferenceRecord, receipt []byte, pool []*types.DevshardTx, reason types.TimeoutReason) (*types.DevshardTx, bool) {
 	if ev == nil || rec == nil {
 		return nil, false
 	}
@@ -185,7 +196,7 @@ func verifiedConfirmOrPending(ev EvidenceVerifier, inferenceID uint64, rec *type
 		if err == nil {
 			return tx, false
 		}
-		pending = pending || evidencePending(ev, err, seq)
+		pending = pending || evidencePending(ev, err, seq, reason)
 	}
 	return nil, pending
 }
@@ -195,11 +206,11 @@ func verifiedConfirmOrPending(ev EvidenceVerifier, inferenceID uint64, rec *type
 // when the record is still pending. Escrow, slot, and the signature are
 // decided by CheckEvidence, the same check the gateway uses.
 func verifiedFinish(ev EvidenceVerifier, escrowID string, inferenceID uint64, rec *types.InferenceRecord, confirm *types.DevshardTx, pool []*types.DevshardTx) *types.DevshardTx {
-	tx, _ := verifiedFinishOrPending(ev, escrowID, inferenceID, rec, confirm, pool)
+	tx, _ := verifiedFinishOrPending(ev, escrowID, inferenceID, rec, confirm, pool, types.TimeoutReason_TIMEOUT_REASON_UNSPECIFIED)
 	return tx
 }
 
-func verifiedFinishOrPending(ev EvidenceVerifier, escrowID string, inferenceID uint64, rec *types.InferenceRecord, confirm *types.DevshardTx, pool []*types.DevshardTx) (*types.DevshardTx, bool) {
+func verifiedFinishOrPending(ev EvidenceVerifier, escrowID string, inferenceID uint64, rec *types.InferenceRecord, confirm *types.DevshardTx, pool []*types.DevshardTx, reason types.TimeoutReason) (*types.DevshardTx, bool) {
 	if ev == nil || rec == nil {
 		return nil, false
 	}
@@ -225,7 +236,7 @@ func verifiedFinishOrPending(ev EvidenceVerifier, escrowID string, inferenceID u
 		if err == nil {
 			return tx, false
 		}
-		pending = pending || evidencePending(ev, err, seq)
+		pending = pending || evidencePending(ev, err, seq, reason)
 	}
 	return nil, pending
 }
@@ -385,7 +396,7 @@ func verifyRefusedTimeout(
 
 	// Fast path: a verified MsgConfirmStart in the local mempool. A finish
 	// alone cannot apply to a pending record, so it is not evidence here.
-	if confirm, pending := verifiedConfirmOrPending(ev, inferenceID, rec, nil, localMempool); confirm != nil {
+	if confirm, pending := verifiedConfirmOrPending(ev, inferenceID, rec, nil, localMempool, types.TimeoutReason_TIMEOUT_REASON_REFUSED); confirm != nil {
 		return false, nil
 	} else if pending {
 		return false, evidencePendingErr(inferenceID)
@@ -405,7 +416,7 @@ func verifyRefusedTimeout(
 		return true, nil
 	}
 	outcome, callErr := challengeRefused(ctx, st.EscrowID, inferenceID, rec, payload, diffs, executorClient, ingest, ev)
-	return finishRefusedChallenge(outcome, callErr, func() bool { return headerPendingDefers(ev, inferenceID) })
+	return finishRefusedChallenge(outcome, callErr, func() bool { return headerPendingDefers(ev, inferenceID, types.TimeoutReason_TIMEOUT_REASON_REFUSED) })
 }
 
 func finishRefusedChallenge(outcome refusedChallenge, callErr error, deferPending func() bool) (bool, error) {
@@ -452,7 +463,7 @@ func judgeRefusedChallenge(
 	}
 	// The receipt counts only as the ExecutorSig of a queued ConfirmStart
 	// that verifies for this escrow and this inference.
-	confirmTx, pending := verifiedConfirmOrPending(ev, inferenceID, rec, receipt, mempool)
+	confirmTx, pending := verifiedConfirmOrPending(ev, inferenceID, rec, receipt, mempool, types.TimeoutReason_TIMEOUT_REASON_REFUSED)
 	if confirmTx == nil {
 		if pending {
 			return refusedNoReceipt, evidencePendingErr(inferenceID)
@@ -507,7 +518,7 @@ func VerifyExecutionTimeout(
 	}
 
 	// Fast path: a verified MsgFinishInference in the local mempool.
-	finish, pending := verifiedFinishOrPending(ev, st.EscrowID, inferenceID, rec, nil, localMempool)
+	finish, pending := verifiedFinishOrPending(ev, st.EscrowID, inferenceID, rec, nil, localMempool, types.TimeoutReason_TIMEOUT_REASON_EXECUTION)
 	if finish != nil {
 		return false, nil
 	}
@@ -517,11 +528,11 @@ func VerifyExecutionTimeout(
 	// to return, and the timeout stands.
 	if executorClient != nil {
 		_, executorMempool, err := executorClient.ChallengeReceipt(ctx, inferenceID, nil, nil)
-		if errors.Is(err, types.ErrHeaderPending) && headerPendingDefers(ev, inferenceID) {
+		if errors.Is(err, types.ErrHeaderPending) && headerPendingDefers(ev, inferenceID, types.TimeoutReason_TIMEOUT_REASON_EXECUTION) {
 			return false, err
 		}
 		if err == nil {
-			finishTx, remotePending := verifiedFinishOrPending(ev, st.EscrowID, inferenceID, rec, nil, executorMempool)
+			finishTx, remotePending := verifiedFinishOrPending(ev, st.EscrowID, inferenceID, rec, nil, executorMempool, types.TimeoutReason_TIMEOUT_REASON_EXECUTION)
 			if finishTx != nil {
 				if ingest != nil {
 					ingest.AddTx(finishTx)

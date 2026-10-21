@@ -316,7 +316,7 @@ func challengeAndMaybeRetry(
 	unreachable func(error) bool,
 ) (bool, error) {
 	outcome, err := challengeOnce(ctx, st, inferenceID, rec, payload, cursor, executorClient, ingest, ev, tip, journal, queryTimeout, unreachable)
-	accept, done, err := classifyChallenge(outcome, err, unreachable, func() bool { return headerPendingDefers(ev, inferenceID) })
+	accept, done, err := classifyChallenge(outcome, err, unreachable, func() bool { return headerPendingDefers(ev, inferenceID, types.TimeoutReason_TIMEOUT_REASON_REFUSED) })
 	if done {
 		return accept, err
 	}
@@ -399,7 +399,7 @@ func refusalAfterProgress(
 			return true, nil
 		}
 		outcome, err := challengeOnce(ctx, st, inferenceID, rec, payload, nonce+1, executorClient, ingest, ev, tip, journal, queryTimeout, unreachable)
-		accept, done, err := classifyChallenge(outcome, err, unreachable, func() bool { return headerPendingDefers(ev, inferenceID) })
+		accept, done, err := classifyChallenge(outcome, err, unreachable, func() bool { return headerPendingDefers(ev, inferenceID, types.TimeoutReason_TIMEOUT_REASON_REFUSED) })
 		if !done {
 			previous = nonce
 			continue

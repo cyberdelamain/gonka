@@ -265,16 +265,16 @@ func TestMovingFutureStampsCannotDeferAVoteForever(t *testing.T) {
 	var d evidenceDeferrals
 	now := time.Unix(1_800_000_000, 0)
 	d.clock = func() time.Time { return now }
-	require.True(t, d.allow(4))
+	require.True(t, d.allow(4, types.TimeoutReason_TIMEOUT_REASON_EXECUTION))
 	for i := 0; i < 20; i++ {
 		now = now.Add(5 * time.Second)
 		if now.Sub(time.Unix(1_800_000_000, 0)) <= PendingEvidenceDeferWindow {
-			require.True(t, d.allow(4))
+			require.True(t, d.allow(4, types.TimeoutReason_TIMEOUT_REASON_EXECUTION))
 		} else {
-			require.False(t, d.allow(4), "a re-signed stamp does not renew the window")
+			require.False(t, d.allow(4, types.TimeoutReason_TIMEOUT_REASON_EXECUTION), "a re-signed stamp does not renew the window")
 		}
 	}
-	require.True(t, d.allow(5), "another inference has its own window")
+	require.True(t, d.allow(5, types.TimeoutReason_TIMEOUT_REASON_EXECUTION), "another inference has its own window")
 }
 
 type pendingExecutor struct{ calls int }
@@ -306,4 +306,61 @@ func TestExecutorHeaderPendingCannotHoldAnExecutionTimeoutForever(t *testing.T) 
 	accept, err := VerifyExecutionTimeout(context.Background(), st, 1, st.Inferences[1], nil, executor, nil, judge)
 	require.NoError(t, err)
 	require.True(t, accept, "after the window the unverifiable answer counts as unreachable, as before")
+}
+
+func TestRefusalWaitDoesNotSpendTheExecutionWindow(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	judge := windowedJudge{EvidenceVerifier: due(newEvidenceGroup(t).sm), deferrals: &evidenceDeferrals{clock: func() time.Time { return now }}}
+	pst := stateWithPendingFull(1, 1)
+	refuser := &progressPeer{steps: []struct {
+		receipt []byte
+		mempool []*types.DevshardTx
+		err     error
+	}{{err: fmt.Errorf("challenge-receipt: %w", types.ErrHeaderPending)}}}
+	accept, err := VerifyRefusedTimeout(context.Background(), pst, 1, pst.Inferences[1], testPayload(), nil, refuser, nil, judge)
+	require.ErrorIs(t, err, types.ErrHeaderPending)
+	require.False(t, accept)
+
+	now = now.Add(5 * time.Minute)
+	sst := stateWithStarted(1, 1)
+	accept, err = VerifyExecutionTimeout(context.Background(), sst, 1, sst.Inferences[1], nil, &pendingExecutor{}, nil, judge)
+	require.ErrorIs(t, err, types.ErrHeaderPending, "the execution stage opens its own window")
+	require.False(t, accept)
+}
+
+type headerPendingEvidence struct {
+	EvidenceVerifier
+	h *Host
+}
+
+func (p headerPendingEvidence) CheckEvidence(*types.InferenceRecord, ...*types.DevshardTx) error {
+	return fmt.Errorf("evidence: %w", types.ErrHeaderPending)
+}
+
+func (p headerPendingEvidence) PendingEvidenceDeferrable(reason types.TimeoutReason, txs ...*types.DevshardTx) bool {
+	return p.h.PendingEvidenceDeferrable(reason, txs...)
+}
+
+func (p headerPendingEvidence) HeaderPendingDeferrable(id uint64, reason types.TimeoutReason) bool {
+	return p.h.HeaderPendingDeferrable(id, reason)
+}
+
+func TestPendingConfirmDoesNotSpendThePendingFinishWindow(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	h := &Host{}
+	h.evidenceDeferrals.clock = func() time.Time { return now }
+	judge := headerPendingEvidence{EvidenceVerifier: due(nil), h: h}
+
+	pst := stateWithPendingFull(1, 1)
+	confirm := &types.DevshardTx{Tx: &types.DevshardTx_ConfirmStart{ConfirmStart: &types.MsgConfirmStart{InferenceId: 1, ExecutorSig: []byte{1}}}}
+	accept, err := VerifyRefusedTimeout(context.Background(), pst, 1, pst.Inferences[1], testPayload(), []*types.DevshardTx{confirm}, nil, nil, judge)
+	require.ErrorIs(t, err, types.ErrHeaderPending)
+	require.False(t, accept)
+
+	now = now.Add(32 * time.Minute)
+	sst := stateWithStarted(1, 1)
+	finish := &types.DevshardTx{Tx: &types.DevshardTx_FinishInference{FinishInference: &types.MsgFinishInference{InferenceId: 1, EscrowId: "escrow-1", ExecutorSlot: 1}}}
+	accept, err = VerifyExecutionTimeout(context.Background(), sst, 1, sst.Inferences[1], []*types.DevshardTx{finish}, nil, nil, judge)
+	require.ErrorIs(t, err, types.ErrHeaderPending, "a Finish waiting for its block opens the execution window")
+	require.False(t, accept)
 }
